@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MySpeedify — Next-Gen Channel Bonding VPN</title>
+  <!-- Google Fonts: Outfit & Inter -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+  <!-- FontAwesome Icons -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <div class="app-background">
+    <div class="glow-orb orb-1"></div>
+    <div class="glow-orb orb-2"></div>
+    <div class="glow-orb orb-3"></div>
+  </div>
+
+  <div class="app-container">
+    <!-- TOP NAVIGATION BAR -->
+    <header class="app-header">
+      <div class="brand-section">
+        <div class="logo-badge">
+          <i class="fa-solid fa-bolt-lightning"></i>
+        </div>
+        <div class="brand-info">
+          <h1>MySpeedify <span class="badge-tag">BONDING VPN</span></h1>
+          <p class="subtitle">Multi-Interface Aggregated Layer-3 Tunnel</p>
+        </div>
+      </div>
+
+      <div class="header-status-group">
+        <div class="status-indicator-pill" id="status-pill">
+          <span class="pulse-dot"></span>
+          <span id="connection-status-text">Bonded & Secure</span>
+        </div>
+        <div class="encryption-tag">
+          <i class="fa-solid fa-shield-halved"></i> ChaCha20-Poly1305
+        </div>
+      </div>
+    </header>
+
+    <!-- MAIN DASHBOARD CONTENT -->
+    <main class="dashboard-grid">
+      
+      <!-- LEFT COLUMN: Primary Metrics & Bonding Modes -->
+      <section class="left-col">
+        
+        <!-- AGGREGATED SPEEDOMETER CARDS -->
+        <div class="stats-row">
+          <div class="metric-card download-card">
+            <div class="metric-header">
+              <span class="metric-label"><i class="fa-solid fa-arrow-down"></i> Bonded Download</span>
+              <span class="metric-badge down-badge">Aggregated</span>
+            </div>
+            <div class="metric-value-container">
+              <span class="metric-num" id="total-download-speed">0.00</span>
+              <span class="metric-unit">Mbps</span>
+            </div>
+            <div class="metric-footer">
+              <span id="total-rx-data"><i class="fa-solid fa-database"></i> 0.0 MB Recv</span>
+            </div>
+          </div>
+
+          <div class="metric-card upload-card">
+            <div class="metric-header">
+              <span class="metric-label"><i class="fa-solid fa-arrow-up"></i> Bonded Upload</span>
+              <span class="metric-badge up-badge">Slices</span>
+            </div>
+            <div class="metric-value-container">
+              <span class="metric-num" id="total-upload-speed">0.00</span>
+              <span class="metric-unit">Mbps</span>
+            </div>
+            <div class="metric-footer">
+              <span id="total-tx-data"><i class="fa-solid fa-database"></i> 0.0 MB Sent</span>
+            </div>
+          </div>
+
+          <div class="metric-card latency-card">
+            <div class="metric-header">
+              <span class="metric-label"><i class="fa-solid fa-gauge-high"></i> Bonded Latency</span>
+              <span class="metric-badge ping-badge">Min RTT</span>
+            </div>
+            <div class="metric-value-container">
+              <span class="metric-num" id="bonded-latency">0.0</span>
+              <span class="metric-unit">ms</span>
+            </div>
+            <div class="metric-footer">
+              <span id="server-uptime"><i class="fa-regular fa-clock"></i> 00:00:00</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- BONDING MODE SELECTOR -->
+        <div class="glass-card mode-selector-card">
+          <div class="card-header">
+            <h3><i class="fa-solid fa-sliders"></i> Channel Bonding Mode</h3>
+            <span class="header-hint">Choose packet distribution strategy</span>
+          </div>
+
+          <div class="mode-options-grid">
+            <div class="mode-btn active" data-mode="speed" id="mode-speed">
+              <div class="mode-icon"><i class="fa-solid fa-rocket"></i></div>
+              <div class="mode-text">
+                <div class="mode-title">Speed Bonding</div>
+                <div class="mode-desc">Dynamic capacity-weighted aggregation. Maximizes throughput.</div>
+              </div>
+              <div class="mode-check"><i class="fa-solid fa-circle-check"></i></div>
+            </div>
+
+            <div class="mode-btn" data-mode="redundant" id="mode-redundant">
+              <div class="mode-icon"><i class="fa-solid fa-shield-virus"></i></div>
+              <div class="mode-text">
+                <div class="mode-title">Redundant / Streamer</div>
+                <div class="mode-desc">Clones packets across all paths. 0% loss for Twitch/VoIP/Gaming.</div>
+              </div>
+              <div class="mode-check"><i class="fa-solid fa-circle-check"></i></div>
+            </div>
+
+            <div class="mode-btn" data-mode="failover" id="mode-failover">
+              <div class="mode-icon"><i class="fa-solid fa-repeat"></i></div>
+              <div class="mode-text">
+                <div class="mode-title">Redundant Failover</div>
+                <div class="mode-desc">Primary link with instantaneous hot-standby failover.</div>
+              </div>
+              <div class="mode-check"><i class="fa-solid fa-circle-check"></i></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- REAL-TIME THROUGHPUT GRAPH -->
+        <div class="glass-card graph-card">
+          <div class="card-header">
+            <div class="header-title-group">
+              <h3><i class="fa-solid fa-chart-line"></i> Real-Time Multi-Interface Traffic</h3>
+              <div class="chart-legend" id="chart-legend">
+                <!-- Legend dynamically populated -->
+              </div>
+            </div>
+            <div class="header-actions">
+              <button class="action-btn" id="btn-toggle-sim">
+                <i class="fa-solid fa-play"></i> <span id="sim-btn-text">Simulate Traffic Burst</span>
+              </button>
+            </div>
+          </div>
+          <div class="canvas-wrapper">
+            <canvas id="trafficCanvas"></canvas>
+          </div>
+        </div>
+
+      </section>
+
+      <!-- RIGHT COLUMN: Physical Adapters & Telemetry -->
+      <section class="right-col">
+        
+        <!-- PHYSICAL ADAPTERS LIST -->
+        <div class="glass-card adapters-card">
+          <div class="card-header">
+            <h3><i class="fa-solid fa-network-wired"></i> Physical Network Adapters</h3>
+            <div class="header-actions">
+              <button id="btn-refresh-adapters" class="btn-icon-sm" title="Scan for network adapters">
+                <i class="fa-solid fa-rotate"></i>
+              </button>
+              <span class="badge-count" id="adapter-count">0 Active</span>
+            </div>
+          </div>
+
+          <div class="adapters-list" id="adapters-container">
+            <!-- Dynamically populated adapter cards -->
+            <div class="loading-state">
+              <i class="fa-solid fa-circle-notch fa-spin"></i> Discovering network adapters...
+            </div>
+          </div>
+        </div>
+
+        <!-- TUNNEL REORDERING & DIAGNOSTICS ENGINE -->
+        <div class="glass-card diagnostics-card">
+          <div class="card-header">
+            <h3><i class="fa-solid fa-microchip"></i> Jitter & Reordering Engine</h3>
+            <span class="header-hint">Sliding Window Jitter Buffer</span>
+          </div>
+          
+          <div class="diagnostics-grid">
+            <div class="diag-item">
+              <span class="diag-label">In-Order Packets:</span>
+              <span class="diag-val" id="diag-delivered">0</span>
+            </div>
+            <div class="diag-item">
+              <span class="diag-label">Out-of-Order Mitigated:</span>
+              <span class="diag-val highlight-amber" id="diag-ooo">0</span>
+            </div>
+            <div class="diag-item">
+              <span class="diag-label">Duplicates Filtered:</span>
+              <span class="diag-val highlight-cyan" id="diag-dup">0</span>
+            </div>
+            <div class="diag-item">
+              <span class="diag-label">Buffered Window:</span>
+              <span class="diag-val" id="diag-buf">0 pkts</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- SERVER RELAY INFO -->
+        <div class="glass-card server-card">
+          <div class="server-info-row">
+            <div class="server-icon"><i class="fa-solid fa-server"></i></div>
+            <div class="server-details">
+              <div class="server-name">Aggregation Relay Node</div>
+              <div class="server-ip" id="server-endpoint">127.0.0.1:51820</div>
+            </div>
+            <div class="server-status-badge">
+              <i class="fa-solid fa-circle"></i> Online
+            </div>
+          </div>
+        </div>
+
+      </section>
+
+    </main>
+  </div>
+
+  <script src="js/app.js"></script>
+</body>
+</html>
