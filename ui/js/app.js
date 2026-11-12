@@ -25,7 +25,15 @@ class MySpeedifyApp {
     this.initCanvas();
     this.fetchInitialStatus();
     this.connectWebSocket();
+    this.startAutoPoll();
     this.startCanvasAnimation();
+  }
+
+  startAutoPoll() {
+    // 1-second continuous auto-update fallback
+    setInterval(() => {
+      this.fetchInitialStatus();
+    }, 1000);
   }
 
   async fetchInitialStatus() {

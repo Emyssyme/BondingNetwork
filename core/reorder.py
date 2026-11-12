@@ -68,7 +68,7 @@ class ReorderBuffer:
         """Called periodically (e.g. every 5ms) to release packets stuck behind a lost packet"""
         if not self.heap:
             return []
-        return self._drain(time.time(), force_expired=True)
+        return self._drain(time.time())
 
     def _drain(self, now: float, force_expired: bool = False) -> List[bytes]:
         ready: List[bytes] = []

@@ -11,8 +11,8 @@ echo "  Installing MySpeedify Aggregation Server        "
 echo "=================================================="
 
 # 1. Update and install prerequisites
-apt-get update
-apt-get install -y python3 python3-pip python3-venv iptables iptables-persistent iproute2 ufw
+apt-get update --allow-releaseinfo-change || true
+apt-get install -y python3 python3-pip python3-venv iptables iproute2 ufw || apt-get install -y python3 python3-pip python3-venv iptables iproute2
 
 # 2. Enable IPv4 and IPv6 Forwarding
 echo "net.ipv4.ip_forward=1" > /etc/sysctl.d/99-myspeedify.conf
@@ -28,8 +28,9 @@ iptables -t nat -A POSTROUTING -o "$WAN_IFACE" -j MASQUERADE
 iptables -A FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT
 iptables -A FORWARD -s 10.8.0.0/24 -j ACCEPT
 
-# Save iptables rules
-netfilter-persistent save
+# Save iptables rules persistently
+mkdir -p /etc/iptables
+iptables-save > /etc/iptables/rules.v4
 
 # 5. Open UDP port 51820 on firewall
 ufw allow 51820/udp comment "MySpeedify Tunnel" || true

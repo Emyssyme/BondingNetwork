@@ -1,0 +1,15 @@
+git checkout -b improve
+
+# copiază patch-ul peste proiect (ajustează calea spre folderul descărcat)
+Copy-Item -Recurse -Force C:\Users\TU\Downloads\patch\* .
+
+# aplică manual editele mici din SMALL_EDITS.md (protocol, prober, reorder, adapter,
+# setup_linux.sh), șterge test_crypto_aead din tests\test_core.py, apoi:
+Remove-Item SMALL_EDITS.md
+
+python -m unittest discover -s tests
+
+git status        # verifică să nu fie secrete sau wintun.dll nedorit
+git add -A
+git commit -m "Production-readiness fixes: authenticated handshake, real TUN data-plane, single I/O thread, API hardening"
+git push -u origin improve

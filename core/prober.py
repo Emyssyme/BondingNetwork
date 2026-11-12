@@ -115,7 +115,7 @@ class LinkProber:
                 session_id=session_id,
                 path_id=path_id,
                 flags=PacketFlag.PROBE,
-                seq_num=0,
+                seq_num=seq,
                 payload=payload
             )
             packets.append((path_id, pkt))

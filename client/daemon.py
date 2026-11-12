@@ -144,6 +144,18 @@ class ClientDaemon:
             return True
         return False
 
+    def get_server_addr(self) -> Tuple[str, int]:
+        """Resolves dynamic DDNS hostnames (e.g. arghire.go.ro) to target IP address"""
+        now = time.time()
+        if not hasattr(self, '_resolved_ip') or (now - getattr(self, '_last_dns_time', 0)) > 15.0:
+            try:
+                self._resolved_ip = socket.gethostbyname(self.server_host)
+                self._last_dns_time = now
+            except Exception:
+                if not hasattr(self, '_resolved_ip'):
+                    self._resolved_ip = self.server_host
+        return (self._resolved_ip, self.server_port)
+
     def step(self):
         """Single non-blocking iteration of the packet I/O engine"""
         if not self.is_running:
@@ -155,17 +167,18 @@ class ClientDaemon:
         if self.prober.should_probe():
             active_path_ids = [pid for pid, (_, adp) in self.paths.items() if adp.enabled]
             probes = self.prober.generate_probes(active_path_ids, self.session_id)
+            target_addr = self.get_server_addr()
             for path_id, pkt in probes:
                 if path_id in self.paths:
                     sock, adapter = self.paths[path_id]
                     raw_bytes = pkt.serialize()
                     try:
-                        sock.sendto(raw_bytes, self.server_addr)
+                        sock.sendto(raw_bytes, target_addr)
                     except Exception as e:
                         logger.debug(f"Probe send error on path {path_id}: {e}")
 
         # 2. Ingress: Read incoming UDP packets across all active physical sockets
-        read_sockets = [sock for sock, (_, adp) in [(s, p) for s, p in self.paths.values() if p.enabled]]
+        read_sockets = [sock for sock, adp in self.paths.values() if adp.enabled]
         if read_sockets:
             readable, _, _ = select.select(read_sockets, [], [], 0.002)
             for sock in readable:
@@ -248,6 +261,7 @@ class ClientDaemon:
             active_adapters=active_paths
         )
 
+        target_addr = self.get_server_addr()
         for path_id, pkt in scheduled:
             encrypted_payload = self.crypto.encrypt(ip_payload, seq, path_id)
             pkt.payload = encrypted_payload
@@ -255,7 +269,7 @@ class ClientDaemon:
             
             sock, adapter = self.paths[path_id]
             try:
-                sock.sendto(raw_bytes, self.server_addr)
+                sock.sendto(raw_bytes, target_addr)
                 adapter.bytes_sent += len(raw_bytes)
                 adapter.total_tx_bytes += len(raw_bytes)
                 self.total_tx_bytes += len(raw_bytes)
@@ -267,9 +281,9 @@ class ClientDaemon:
         now = time.time()
         elapsed = now - self.last_rate_time
         if elapsed >= 0.5:
-            # Update each adapter rate
+            # Update each adapter rate — update_rates() reads psutil directly, no args needed
             for _, adapter in self.paths.values():
-                adapter.update_rates(adapter.total_tx_bytes, adapter.total_rx_bytes)
+                adapter.update_rates()
                 
             total_up_bps = sum(adp.upload_speed_bps for _, adp in self.paths.values() if adp.enabled)
             total_down_bps = sum(adp.download_speed_bps for _, adp in self.paths.values() if adp.enabled)

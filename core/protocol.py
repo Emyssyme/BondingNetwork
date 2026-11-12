@@ -67,19 +67,14 @@ class Packet:
         self.payload = payload
         self.timestamp = time.time()
 
-    def serialize(self) -> bytes:
-        header = struct.pack(
-            HEADER_FORMAT,
-            MAGIC,
-            self.version,
-            int(self.pkt_type),
-            self.session_id,
-            self.path_id,
-            self.flags,
-            b'\x00\x00',
-            self.seq_num
+    def header_bytes(self) -> bytes:
+        return struct.pack(
+            HEADER_FORMAT, MAGIC, self.version, int(self.pkt_type), self.session_id,
+            self.path_id, int(self.flags), b'\x00\x00', self.seq_num
         )
-        return header + self.payload
+
+    def serialize(self) -> bytes:
+        return self.header_bytes() + self.payload
 
     @classmethod
     def deserialize(cls, data: bytes) -> 'Packet | None':
