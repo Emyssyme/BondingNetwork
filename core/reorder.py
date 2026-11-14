@@ -23,10 +23,12 @@ class ReorderBuffer:
         # Priority queue storing (seq_num, arrival_time, payload)
         self.heap: List[Tuple[int, float, bytes]] = []
         self.seen_seqs = set()
+        self._delayed_seqs = set()
         
         # Statistics
         self.delivered_count: int = 0
         self.out_of_order_count: int = 0
+        self.delayed_count: int = 0
         self.dropped_duplicate_count: int = 0
         self.gap_skip_count: int = 0
 
@@ -35,6 +37,7 @@ class ReorderBuffer:
         self.initialized = True
         self.heap.clear()
         self.seen_seqs.clear()
+        self._delayed_seqs.clear()
 
     def push(self, seq_num: int, payload: bytes) -> List[bytes]:
         """
@@ -58,17 +61,25 @@ class ReorderBuffer:
             
         self.seen_seqs.add(seq_num)
         heapq.heappush(self.heap, (seq_num, now, payload))
-        
         if seq_num != self.expected_seq:
             self.out_of_order_count += 1
+            self._delayed_seqs.add(seq_num)
             
         return self._drain(now)
 
     def flush_expired(self) -> List[bytes]:
-        """Called periodically (e.g. every 5ms) to release packets stuck behind a lost packet"""
+        """Release packets whose missing predecessors have exceeded the hold time."""
         if not self.heap:
             return []
         return self._drain(time.time())
+
+    def time_until_expiry(self) -> Optional[float]:
+        if not self.heap:
+            return None
+        if len(self.heap) >= self.max_buffer_size:
+            return 0.0
+        arrival_time = self.heap[0][1]
+        return max(0.0, self.max_hold_time - (time.time() - arrival_time))
 
     def _drain(self, now: float, force_expired: bool = False) -> List[bytes]:
         ready: List[bytes] = []
@@ -80,6 +91,9 @@ class ReorderBuffer:
             if seq_num == self.expected_seq:
                 heapq.heappop(self.heap)
                 self.seen_seqs.discard(seq_num)
+                if seq_num in self._delayed_seqs:
+                    self._delayed_seqs.remove(seq_num)
+                    self.delayed_count += 1
                 self.expected_seq += 1
                 self.delivered_count += 1
                 ready.append(payload)
@@ -96,6 +110,9 @@ class ReorderBuffer:
                 
                 heapq.heappop(self.heap)
                 self.seen_seqs.discard(seq_num)
+                if seq_num in self._delayed_seqs:
+                    self._delayed_seqs.remove(seq_num)
+                    self.delayed_count += 1
                 self.expected_seq += 1
                 self.delivered_count += 1
                 ready.append(payload)
@@ -115,6 +132,7 @@ class ReorderBuffer:
             "buffered_packets": len(self.heap),
             "delivered": self.delivered_count,
             "out_of_order": self.out_of_order_count,
+            "delayed": self.delayed_count,
             "duplicates_dropped": self.dropped_duplicate_count,
             "gap_skips": self.gap_skip_count
         }

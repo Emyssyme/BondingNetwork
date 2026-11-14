@@ -3,13 +3,10 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com; font-src 'self' https://cdnjs.cloudflare.com; connect-src 'self' ws: wss:; object-src 'none'; base-uri 'self'; form-action 'self'">
   <title>MySpeedify — Next-Gen Channel Bonding VPN</title>
-  <!-- Google Fonts: Outfit & Inter -->
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
   <!-- FontAwesome Icons -->
-  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" integrity="sha384-iw3OoTErCYJJB9mCa8LNS2hbsQ7M3C0EpIsO/H5+EGAkPGc6rk+V8i04oW/K5xq0" crossorigin="anonymous" referrerpolicy="no-referrer">
   <link rel="stylesheet" href="css/style.css">
 </head>
 <body>
@@ -35,7 +32,7 @@
       <div class="header-status-group">
         <div class="status-indicator-pill" id="status-pill">
           <span class="pulse-dot"></span>
-          <span id="connection-status-text">Bonded & Secure</span>
+          <span id="connection-status-text">Connecting</span>
         </div>
         <div class="encryption-tag">
           <i class="fa-solid fa-shield-halved"></i> ChaCha20-Poly1305
@@ -141,7 +138,7 @@
               </div>
             </div>
             <div class="header-actions">
-              <button class="action-btn" id="btn-toggle-sim">
+              <button class="action-btn" id="btn-toggle-sim" hidden>
                 <i class="fa-solid fa-play"></i> <span id="sim-btn-text">Simulate Traffic Burst</span>
               </button>
             </div>
@@ -191,6 +188,10 @@
             <div class="diag-item">
               <span class="diag-label">Out-of-Order Mitigated:</span>
               <span class="diag-val highlight-amber" id="diag-ooo">0</span>
+            </div>
+            <div class="diag-item">
+              <span class="diag-label">Packets Delayed:</span>
+              <span class="diag-val" id="diag-delayed">0</span>
             </div>
             <div class="diag-item">
               <span class="diag-label">Duplicates Filtered:</span>

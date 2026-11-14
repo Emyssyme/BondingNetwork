@@ -4,6 +4,7 @@ Identifies physical network interfaces (Wi-Fi, Ethernet, Cellular, USB Hotspots)
 and tracks real-time throughput, MTU, IP, and adapter states.
 """
 
+import json
 import os
 import socket
 import psutil
@@ -13,9 +14,20 @@ import platform
 from typing import Dict, List, Optional
 
 class NetworkAdapter:
-    def __init__(self, name: str, ip: str, is_wifi: bool = False, is_cellular: bool = False, description: str = ""):
+    def __init__(
+        self,
+        name: str,
+        ip: str,
+        is_wifi: bool = False,
+        is_cellular: bool = False,
+        description: str = "",
+        interface_name: Optional[str] = None,
+        if_index: Optional[int] = None,
+    ):
         self.name: str = name
         self.ip: str = ip
+        self.interface_name = interface_name or name
+        self.if_index = if_index
         self.description: str = description
         self.is_wifi: bool = is_wifi
         self.is_cellular: bool = is_cellular
@@ -32,7 +44,7 @@ class NetworkAdapter:
         # Live Throughput Tracking
         self.bytes_sent: int = 0
         self.bytes_recv: int = 0
-        self.last_check_time: float = time.time()
+        self.last_check_time: float = time.monotonic()
         self.upload_speed_bps: float = 0.0
         self.download_speed_bps: float = 0.0
         
@@ -43,59 +55,30 @@ class NetworkAdapter:
         # Speed history for sliding-window smoothing — initialized here to survive adapter rescans
         self._speed_hist_up: list = []
         self._speed_hist_down: list = []
-        self._last_sys_tx: Optional[int] = None
-        self._last_sys_rx: Optional[int] = None
+        self._last_tx_total: Optional[int] = None
+        self._last_rx_total: Optional[int] = None
 
-    def update_rates(self):
-        """Reads per-NIC byte counters from psutil and updates smoothed speed estimates.
-        Uses a 5-sample sliding window with outlier (spike) trimming.
-        History is preserved across adapter rescans because it's initialized in __init__.
+    def update_rates(self, tx_total: int, rx_total: int) -> None:
+        """Updates smoothed throughput estimates from this path's byte counters.
+        Uses a 6-sample sliding window and a monotonic clock.
         """
-        now = time.time()
+        now = time.monotonic()
         elapsed = now - self.last_check_time
         if elapsed < 0.5:
-            # Don't update more often than every 0.5s to avoid noise from tiny deltas
             return
-        
-        nic_counters = psutil.net_io_counters(pernic=True)
-        stats = nic_counters.get(self.name)
-        
-        if stats:
-            sys_tx = stats.bytes_sent
-            sys_rx = stats.bytes_recv
-            
-            if self._last_sys_tx is not None and self._last_sys_rx is not None:
-                delta_tx = max(0, sys_tx - self._last_sys_tx)
-                delta_rx = max(0, sys_rx - self._last_sys_rx)
-                
-                # Guard against counter resets (e.g. NIC reconnect) — skip that sample
-                max_plausible_bytes = 1_250_000_000 * elapsed  # 10 Gbps max
-                if delta_tx > max_plausible_bytes or delta_rx > max_plausible_bytes:
-                    # Counter likely reset; just update baseline and skip this sample
-                    self._last_sys_tx = sys_tx
-                    self._last_sys_rx = sys_rx
-                    self.last_check_time = now
-                    return
-                
-                instant_up_bps   = (delta_tx * 8.0) / elapsed
-                instant_down_bps = (delta_rx * 8.0) / elapsed
-                
-                self._speed_hist_up.append(instant_up_bps)
-                self._speed_hist_down.append(instant_down_bps)
-                
-                # Sliding window: keep last 6 samples (~3 seconds at 0.5s intervals)
-                self._speed_hist_up   = self._speed_hist_up[-6:]
-                self._speed_hist_down = self._speed_hist_down[-6:]
-                
-                self.upload_speed_bps   = self._smooth(self._speed_hist_up)
-                self.download_speed_bps = self._smooth(self._speed_hist_down)
-                
-                self.total_tx_bytes += delta_tx
-                self.total_rx_bytes += delta_rx
-            
-            self._last_sys_tx = sys_tx
-            self._last_sys_rx = sys_rx
-        
+
+        if self._last_tx_total is not None and self._last_rx_total is not None:
+            delta_tx = max(0, tx_total - self._last_tx_total)
+            delta_rx = max(0, rx_total - self._last_rx_total)
+            self._speed_hist_up.append((delta_tx * 8.0) / elapsed)
+            self._speed_hist_down.append((delta_rx * 8.0) / elapsed)
+            self._speed_hist_up = self._speed_hist_up[-6:]
+            self._speed_hist_down = self._speed_hist_down[-6:]
+            self.upload_speed_bps = self._smooth(self._speed_hist_up)
+            self.download_speed_bps = self._smooth(self._speed_hist_down)
+
+        self._last_tx_total = tx_total
+        self._last_rx_total = rx_total
         self.last_check_time = now
     
     @staticmethod
@@ -171,6 +154,64 @@ def get_windows_adapter_descriptions() -> Dict[str, str]:
     return descs
 
 
+def get_windows_interface_indices() -> Dict[str, int]:
+    """Map Windows adapter aliases to the IPv4 interface indexes used by Winsock."""
+    if platform.system() != "Windows":
+        return {}
+
+    command = (
+        "[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding; "
+        "$OutputEncoding = [Console]::OutputEncoding; "
+        "Get-NetIPInterface -AddressFamily IPv4 | "
+        "Select-Object InterfaceAlias,InterfaceIndex | ConvertTo-Json -Compress"
+    )
+    system_root = os.environ.get("SystemRoot")
+    if not system_root:
+        raise RuntimeError("SystemRoot is not set; cannot query Windows interface indexes")
+    powershell = os.path.join(
+        system_root,
+        "System32",
+        "WindowsPowerShell",
+        "v1.0",
+        "powershell.exe",
+    )
+    try:
+        result = subprocess.run(
+            [
+                powershell,
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                command,
+            ],
+            check=True,
+            capture_output=True,
+            timeout=10,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        entries = json.loads(result.stdout.decode("utf-8"))
+    except (OSError, subprocess.SubprocessError, UnicodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("Could not query Windows IPv4 interface indexes") from exc
+
+    if entries is None:
+        return {}
+    if isinstance(entries, dict):
+        entries = [entries]
+    if not isinstance(entries, list):
+        raise RuntimeError("PowerShell returned an invalid Windows interface index list")
+
+    indices: Dict[str, int] = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise RuntimeError("PowerShell returned an invalid Windows interface entry")
+        name = entry.get("InterfaceAlias")
+        index = entry.get("InterfaceIndex")
+        if not isinstance(name, str) or type(index) is not int or index <= 0:
+            raise RuntimeError("PowerShell returned an invalid Windows interface entry")
+        indices[name] = index
+    return indices
+
+
 class AdapterManager:
     def __init__(self):
         self.adapters: Dict[str, NetworkAdapter] = {}
@@ -181,6 +222,7 @@ class AdapterManager:
         net_if_addrs = psutil.net_if_addrs()
         net_if_stats = psutil.net_if_stats()
         win_descs = get_windows_adapter_descriptions()
+        win_indices = get_windows_interface_indices()
         
         ignored_keywords = [
             'loopback', 'wsl', 'veth', 'docker', 'hyper-v', 
@@ -209,6 +251,12 @@ class AdapterManager:
             stats = net_if_stats.get(iface_name)
             if not stats or not stats.isup:
                 continue
+            if_index = win_indices.get(iface_name)
+            if if_index is None:
+                try:
+                    if_index = socket.if_nametoindex(iface_name)
+                except (OSError, ValueError):
+                    if_index = None
 
             for addr in addrs:
                 if addr.family == socket.AF_INET and not addr.address.startswith("127.") and not addr.address.startswith("169.254."):
@@ -226,11 +274,15 @@ class AdapterManager:
                             ip=ip,
                             is_wifi=is_wifi,
                             is_cellular=is_cellular,
-                            description=desc
+                            description=desc,
+                            interface_name=iface_name,
+                            if_index=if_index,
                         )
                         self.adapters[ip] = adapter
                     else:
                         self.adapters[ip].name = iface_name
+                        self.adapters[ip].interface_name = iface_name
+                        self.adapters[ip].if_index = if_index
                         self.adapters[ip].description = desc
                         self.adapters[ip].is_wifi = is_wifi
                         self.adapters[ip].is_cellular = is_cellular
@@ -244,6 +296,7 @@ class AdapterManager:
         # for bonding demonstration if only 1 physical NIC is found
         if len(self.adapters) == 1 and os.environ.get("MYSPEEDIFY_SIMULATE_PATHS", "0") == "1":
             primary_ip = list(self.adapters.keys())[0]
+            primary_adapter = self.adapters[primary_ip]
             sim_ip = "127.0.0.2"
             if sim_ip not in self.adapters:
                 self.adapters[sim_ip] = NetworkAdapter(
@@ -251,7 +304,9 @@ class AdapterManager:
                     ip=primary_ip,  # uses primary route for UDP packets but distinct channel identifier
                     is_wifi=False,
                     is_cellular=True,
-                    description="Simulated Secondary Multi-Path Connection"
+                    description="Simulated Secondary Multi-Path Connection",
+                    interface_name=primary_adapter.interface_name,
+                    if_index=primary_adapter.if_index,
                 )
 
         return list(self.adapters.values())

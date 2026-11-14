@@ -12,6 +12,11 @@ class BaseTunInterface(ABC):
         pass
 
     @abstractmethod
+    def set_ip(self, ip: str, netmask: str = "255.255.255.0", mtu: int = 1420) -> None:
+        """Changes the address of an already-open TUN device."""
+        pass
+
+    @abstractmethod
     def read(self, size: int = 2048) -> Optional[bytes]:
         """Reads a single raw IP packet from the OS network stack"""
         pass

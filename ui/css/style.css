@@ -24,9 +24,9 @@
   --text-secondary: #94a3b8;
   --text-muted: #64748b;
   
-  --font-heading: 'Outfit', sans-serif;
-  --font-body: 'Inter', sans-serif;
-  --font-mono: 'JetBrains Mono', monospace;
+  --font-heading: system-ui, sans-serif;
+  --font-body: system-ui, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Consolas, monospace;
   
   --radius-sm: 8px;
   --radius-md: 14px;
@@ -194,6 +194,34 @@ body {
   font-size: 13px;
   font-weight: 600;
   color: var(--emerald-success);
+}
+
+.status-indicator-pill[data-state="connecting"],
+.status-indicator-pill[data-state="disconnected"] {
+  background: rgba(245, 158, 11, 0.1);
+  border-color: rgba(245, 158, 11, 0.3);
+  color: var(--amber-warning);
+}
+
+.status-indicator-pill[data-state="error"] {
+  background: rgba(239, 68, 68, 0.1);
+  border-color: rgba(239, 68, 68, 0.3);
+  color: #ef4444;
+}
+
+.status-indicator-pill[data-state="connecting"] .pulse-dot,
+.status-indicator-pill[data-state="disconnected"] .pulse-dot {
+  background: var(--amber-warning);
+  box-shadow: 0 0 10px var(--amber-warning);
+}
+
+.status-indicator-pill[data-state="error"] .pulse-dot {
+  background: #ef4444;
+  box-shadow: 0 0 10px #ef4444;
+}
+
+#btn-toggle-sim[hidden] {
+  display: none;
 }
 
 .pulse-dot {

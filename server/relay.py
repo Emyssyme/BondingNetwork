@@ -16,6 +16,7 @@ from core.reorder import ReorderBuffer
 from core.scheduler import PacketScheduler, BondingMode
 from core.adapter import NetworkAdapter
 from core.prober import LinkProber
+from core.secret import load_secret
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("MySpeedify.RelayServer")
@@ -46,10 +47,21 @@ class ClientSession:
 
 
 class RelayServer:
-    def __init__(self, host: str = "0.0.0.0", port: int = 51820, passphrase: str = "myspeedify_secret_key_2026"):
+    def __init__(
+        self,
+        host: str = "0.0.0.0",
+        port: int = 51820,
+        passphrase: Optional[str] = None,
+    ):
+        if passphrase is None:
+            passphrase = load_secret()
+        if not passphrase:
+            raise ValueError(
+                "A relay passphrase is required via the constructor or "
+                "MYSPEEDIFY_SECRET/MYSPEEDIFY_SECRET_FILE."
+            )
         self.host = host
         self.port = port
-        self.passphrase = passphrase
         self.crypto = TunnelCrypto.from_passphrase(passphrase)
         self.sock: Optional[socket.socket] = None
         self.is_running: bool = False

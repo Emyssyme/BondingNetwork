@@ -9,35 +9,60 @@ Local-only control plane. Protection against other websites / local processes:
 """
 
 import asyncio
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 import hmac
 import json
 import logging
 import os
 import random
 import secrets
-from typing import Literal, Optional
+from typing import AsyncGenerator, Literal, Optional
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from .daemon import ClientDaemon
+if __package__:
+    from .daemon import ClientDaemon
+else:
+    from daemon import ClientDaemon
 
 logger = logging.getLogger("MySpeedify.API")
 
 DEV = os.environ.get("MYSPEEDIFY_DEV") == "1"
 COOKIE = "msp_session"
 
-app = FastAPI(title="MySpeedify VPN Controller")
 
-daemon_instance: Optional[ClientDaemon] = None
-API_TOKEN: str = ""
-ALLOWED_HOSTS: set = set()
-ALLOWED_ORIGINS: set = set()
+@dataclass
+class APIState:
+    daemon: Optional[ClientDaemon] = None
+    token: str = ""
+    allowed_hosts: set[str] = field(default_factory=set)
+    allowed_origins: set[str] = field(default_factory=set)
+    is_simulating: bool = False
+    sim_task: Optional[asyncio.Task[None]] = None
 
-is_simulating = False
-sim_task: Optional[asyncio.Task] = None
+
+@asynccontextmanager
+async def lifespan(application: FastAPI) -> AsyncGenerator[None, None]:
+    yield
+    state: APIState = application.state.runtime
+    state.is_simulating = False
+    task = state.sim_task
+    state.sim_task = None
+    if task is not None:
+        if not task.done():
+            task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
+app = FastAPI(title="MySpeedify VPN Controller", lifespan=lifespan)
+app.state.runtime = APIState()
 
 
 class ModeRequest(BaseModel):
@@ -55,7 +80,8 @@ class AdapterPriorityRequest(BaseModel):
 
 
 def _token_ok(value: Optional[str]) -> bool:
-    return bool(value) and hmac.compare_digest(value.encode(), API_TOKEN.encode())
+    token = app.state.runtime.token
+    return bool(value) and hmac.compare_digest(value.encode(), token.encode())
 
 
 def _no_daemon():
@@ -64,14 +90,15 @@ def _no_daemon():
 
 @app.middleware("http")
 async def guard(request, call_next):
-    if request.headers.get("host", "") not in ALLOWED_HOSTS:
+    state: APIState = request.app.state.runtime
+    if request.headers.get("host", "") not in state.allowed_hosts:
         return PlainTextResponse("Forbidden host", status_code=403)
     origin = request.headers.get("origin")
-    if origin is not None and origin not in ALLOWED_ORIGINS:
+    if origin is not None and origin not in state.allowed_origins:
         return PlainTextResponse("Forbidden origin", status_code=403)
     if request.url.path == "/" and _token_ok(request.query_params.get("token")):
         resp = RedirectResponse("/", status_code=303)
-        resp.set_cookie(COOKIE, API_TOKEN, httponly=True, samesite="strict", path="/")
+        resp.set_cookie(COOKIE, state.token, httponly=True, samesite="strict", path="/")
         return resp
     if not _token_ok(request.cookies.get(COOKIE)):
         return PlainTextResponse("Unauthorized: open the URL printed at startup", status_code=401)
@@ -80,62 +107,76 @@ async def guard(request, call_next):
 
 @app.get("/api/status")
 async def get_status():
-    if not daemon_instance:
+    state: APIState = app.state.runtime
+    daemon = state.daemon
+    if daemon is None:
         return _no_daemon()
-    return daemon_instance.get_telemetry()
+    data = dict(daemon.get_telemetry())
+    data["is_simulating"] = state.is_simulating
+    data["dev_mode"] = DEV
+    return data
 
 
 @app.post("/api/mode")
 async def set_mode(req: ModeRequest):
-    if not daemon_instance:
+    daemon = app.state.runtime.daemon
+    if daemon is None:
         return _no_daemon()
-    return {"success": daemon_instance.set_bonding_mode(req.mode), "mode": req.mode}
+    return {"success": daemon.set_bonding_mode(req.mode), "mode": req.mode}
 
 
 @app.post("/api/adapter/toggle")
 async def toggle_adapter(req: AdapterToggleRequest):
-    if not daemon_instance:
+    daemon = app.state.runtime.daemon
+    if daemon is None:
         return _no_daemon()
-    return {"success": daemon_instance.toggle_adapter(req.ip, req.enabled)}
+    return {"success": daemon.toggle_adapter(req.ip, req.enabled)}
 
 
 @app.post("/api/adapter/priority")
 async def set_adapter_priority(req: AdapterPriorityRequest):
-    if not daemon_instance:
+    daemon = app.state.runtime.daemon
+    if daemon is None:
         return _no_daemon()
-    return {"success": daemon_instance.set_adapter_priority(req.ip, req.priority)}
+    return {"success": daemon.set_adapter_priority(req.ip, req.priority)}
 
 
 @app.post("/api/adapters/refresh")
 async def refresh_adapters():
-    if not daemon_instance:
+    daemon = app.state.runtime.daemon
+    if daemon is None:
         return _no_daemon()
-    daemon_instance.refresh_paths()          # scanner thread + I/O thread apply it
-    return daemon_instance.get_telemetry()
+    daemon.refresh_paths()          # scanner thread + I/O thread apply it
+    return daemon.get_telemetry()
 
 
 @app.post("/api/toggle-simulation")
 async def toggle_simulation():
-    global is_simulating, sim_task
     if not DEV:
         return JSONResponse({"error": "Not available"}, status_code=404)
-    is_simulating = not is_simulating
-    if is_simulating and (not sim_task or sim_task.done()):
-        sim_task = asyncio.create_task(simulate_traffic_loop())
-    return {"is_simulating": is_simulating}
+    state: APIState = app.state.runtime
+    state.is_simulating = not state.is_simulating
+    if state.is_simulating and (not state.sim_task or state.sim_task.done()):
+        state.sim_task = asyncio.create_task(simulate_traffic_loop())
+    return {"is_simulating": state.is_simulating}
 
 
 async def simulate_traffic_loop():
     """DEV only: synthetic counters for UI demos."""
-    while is_simulating and daemon_instance and daemon_instance.is_running:
-        for _pid, (_sock, adapter) in list(daemon_instance.paths.items()):
+    state: APIState = app.state.runtime
+    while (
+        state.is_simulating
+        and state.daemon is not None
+        and state.daemon.is_running
+    ):
+        for _, (_, adapter) in list(state.daemon.paths.items()):
             if not adapter.enabled:
                 continue
             burst = random.randint(30_000, 180_000)
             adapter.total_tx_bytes += burst
             adapter.total_rx_bytes += burst * 2
-            daemon_instance.total_tx_bytes += burst
-            daemon_instance.total_rx_bytes += burst * 2
+            state.daemon.total_tx_bytes += burst
+            state.daemon.total_rx_bytes += burst * 2
             adapter.latency_ms = max(5.0, adapter.latency_ms + random.uniform(-2.0, 2.0))
             adapter.jitter_ms = max(0.5, random.uniform(0.8, 3.2))
         await asyncio.sleep(0.25)
@@ -143,18 +184,20 @@ async def simulate_traffic_loop():
 
 @app.websocket("/ws/telemetry")
 async def websocket_telemetry(websocket: WebSocket):
+    state: APIState = websocket.app.state.runtime
     origin = websocket.headers.get("origin")
-    if (websocket.headers.get("host", "") not in ALLOWED_HOSTS
-            or (origin is not None and origin not in ALLOWED_ORIGINS)
+    if (websocket.headers.get("host", "") not in state.allowed_hosts
+            or (origin is not None and origin not in state.allowed_origins)
             or not _token_ok(websocket.cookies.get(COOKIE))):
         await websocket.close(code=1008)
         return
     await websocket.accept()
     try:
         while True:
-            if daemon_instance:
-                data = dict(daemon_instance.get_telemetry())   # copy: the snapshot is shared
-                data["is_simulating"] = is_simulating
+            if state.daemon is not None:
+                data = dict(state.daemon.get_telemetry())   # copy: the snapshot is shared
+                data["is_simulating"] = state.is_simulating
+                data["dev_mode"] = DEV
                 await websocket.send_text(json.dumps(data))
             await asyncio.sleep(0.25)                          # 4 Hz is plenty for the dashboard
     except (WebSocketDisconnect, RuntimeError):
@@ -163,11 +206,11 @@ async def websocket_telemetry(websocket: WebSocket):
 
 def init_api(daemon: ClientDaemon, ui_dir: str, port: int) -> str:
     """Wires the daemon, returns the one-time login token for the dashboard URL."""
-    global daemon_instance, API_TOKEN
-    daemon_instance = daemon
-    API_TOKEN = secrets.token_urlsafe(32)
-    ALLOWED_HOSTS.update({f"127.0.0.1:{port}", f"localhost:{port}"})
-    ALLOWED_ORIGINS.update({f"http://127.0.0.1:{port}", f"http://localhost:{port}"})
+    state: APIState = app.state.runtime
+    state.daemon = daemon
+    state.token = secrets.token_urlsafe(32)
+    state.allowed_hosts.update({f"127.0.0.1:{port}", f"localhost:{port}"})
+    state.allowed_origins.update({f"http://127.0.0.1:{port}", f"http://localhost:{port}"})
     if os.path.exists(ui_dir):
         app.mount("/", StaticFiles(directory=ui_dir, html=True), name="ui")
-    return API_TOKEN
+    return state.token

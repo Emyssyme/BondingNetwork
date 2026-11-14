@@ -21,6 +21,9 @@ class LinuxTun(BaseTunInterface):
         self.name = name
         self.fd: Optional[int] = None
         self.is_open = False
+        self.ip = "10.8.0.2"
+        self.netmask = "255.255.255.0"
+        self.mtu = 1380
 
     def open(self, ip: str = "10.8.0.2", netmask: str = "255.255.255.0", mtu: int = 1380) -> bool:
         fd = os.open("/dev/net/tun", os.O_RDWR | os.O_NONBLOCK)
@@ -36,11 +39,37 @@ class LinuxTun(BaseTunInterface):
             raise
         self.fd = fd
         self.is_open = True
+        self.ip = ip
+        self.netmask = netmask
+        self.mtu = mtu
         logger.info("TUN %s up: %s/%d mtu=%d", self.name, ip, prefix, mtu)
         return True
 
+    def set_ip(self, ip: str, netmask: str = "255.255.255.0", mtu: int = 1380) -> None:
+        if not self.is_open:
+            raise RuntimeError("Cannot change the address of a closed TUN device")
+
+        prefix = sum(bin(int(o)).count("1") for o in netmask.split("."))
+        subprocess.run(["ip", "addr", "replace", f"{ip}/{prefix}", "dev", self.name],
+                       check=True, capture_output=True)
+
+        if self.ip != ip or self.netmask != netmask:
+            old_prefix = sum(bin(int(o)).count("1") for o in self.netmask.split("."))
+            subprocess.run(["ip", "addr", "del", f"{self.ip}/{old_prefix}", "dev", self.name],
+                           check=True, capture_output=True)
+
+        subprocess.run(["ip", "link", "set", "dev", self.name, "mtu", str(mtu)],
+                       check=True, capture_output=True)
+        self.ip = ip
+        self.netmask = netmask
+        self.mtu = mtu
+
     def fileno(self) -> int:
         return self.fd
+
+    @property
+    def supports_readiness(self) -> bool:
+        return self.fd is not None
 
     def read(self, size: int = 2048) -> Optional[bytes]:
         if not self.is_open:

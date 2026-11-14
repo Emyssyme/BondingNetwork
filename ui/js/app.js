@@ -16,6 +16,8 @@ class MySpeedifyApp {
       total: new Array(this.chartHistoryLength).fill(0),
       adapters: {} // ip -> array of speeds
     };
+    this.adapterCards = new Map();
+    this.pendingAdapterToggles = new Map();
     
     this.colorPalette = ['#00f0ff', '#8b5cf6', '#10b981', '#f59e0b', '#ec4899'];
 
@@ -30,10 +32,11 @@ class MySpeedifyApp {
   }
 
   startAutoPoll() {
-    // 1-second continuous auto-update fallback
     setInterval(() => {
-      this.fetchInitialStatus();
-    }, 1000);
+      if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+        this.fetchInitialStatus();
+      }
+    }, 2000);
   }
 
   async fetchInitialStatus() {
@@ -59,6 +62,7 @@ class MySpeedifyApp {
     this.elAdapterCount = document.getElementById('adapter-count');
     this.elDiagDelivered = document.getElementById('diag-delivered');
     this.elDiagOoo = document.getElementById('diag-ooo');
+    this.elDiagDelayed = document.getElementById('diag-delayed');
     this.elDiagDup = document.getElementById('diag-dup');
     this.elDiagBuf = document.getElementById('diag-buf');
     this.elServerEndpoint = document.getElementById('server-endpoint');
@@ -66,8 +70,18 @@ class MySpeedifyApp {
     this.btnSim = document.getElementById('btn-toggle-sim');
     this.simBtnText = document.getElementById('sim-btn-text');
     this.btnRefreshAdapters = document.getElementById('btn-refresh-adapters');
+    this.elStatusPill = document.getElementById('status-pill');
+    this.elConnectionStatus = document.getElementById('connection-status-text');
     if (this.btnRefreshAdapters) {
       this.btnRefreshAdapters.addEventListener('click', () => this.refreshAdapters());
+    }
+    if (this.elAdaptersContainer) {
+      this.elAdaptersContainer.addEventListener('change', (event) => {
+        const toggle = event.target;
+        if (toggle.matches('.adapter-toggle-input')) {
+          this.toggleAdapter(toggle);
+        }
+      });
     }
   }
 
@@ -96,6 +110,29 @@ class MySpeedifyApp {
       }
     } catch (e) {
       console.error('Failed to switch mode:', e);
+    }
+  }
+
+  async toggleAdapter(toggle) {
+    const ip = toggle.dataset.ip;
+    const requestedState = toggle.checked;
+    this.pendingAdapterToggles.set(ip, requestedState);
+    toggle.disabled = true;
+    try {
+      const res = await fetch('/api/adapter/toggle', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ip, enabled: requestedState })
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const result = await res.json();
+      if (!result.success) throw new Error('Adapter was not found or could not be changed');
+    } catch (e) {
+      toggle.checked = !requestedState;
+      console.error('Failed to toggle adapter:', e);
+    } finally {
+      this.pendingAdapterToggles.delete(ip);
+      toggle.disabled = false;
     }
   }
 
@@ -175,8 +212,15 @@ class MySpeedifyApp {
 
   handleTelemetry(data) {
     this.telemetry = data;
-    this.isSimulating = !!data.is_simulating;
+    this.isSimulating = data.dev_mode === true && !!data.is_simulating;
+    if (this.btnSim) this.btnSim.hidden = data.dev_mode !== true;
     this.updateSimButtonUI();
+    const state = data.state || (data.is_connected ? 'connected' : 'connecting');
+    const connected = data.is_connected === true && state !== 'error';
+    this.elStatusPill.dataset.state = state;
+    this.elConnectionStatus.textContent = connected
+      ? 'Connected'
+      : (state === 'error' ? 'Error' : (state === 'disconnected' ? 'Disconnected' : 'Connecting'));
 
     // Top Level Metrics
     this.elTotalDown.textContent = data.download_mbps.toFixed(2);
@@ -199,6 +243,7 @@ class MySpeedifyApp {
     if (data.reorder_stats) {
       this.elDiagDelivered.textContent = data.reorder_stats.delivered.toLocaleString();
       this.elDiagOoo.textContent = data.reorder_stats.out_of_order.toLocaleString();
+      this.elDiagDelayed.textContent = data.reorder_stats.delayed.toLocaleString();
       this.elDiagDup.textContent = data.reorder_stats.duplicates_dropped.toLocaleString();
       this.elDiagBuf.textContent = `${data.reorder_stats.buffered_packets} pkts`;
     }
@@ -212,87 +257,147 @@ class MySpeedifyApp {
 
   renderAdapters(adapters) {
     this.elAdapterCount.textContent = `${adapters.filter(a => a.enabled).length} Active`;
-    
+
     if (adapters.length === 0) {
-      this.elAdaptersContainer.innerHTML = '<div class="loading-state">No network adapters detected</div>';
+      const empty = document.createElement('div');
+      empty.className = 'loading-state';
+      empty.textContent = 'No network adapters detected';
+      this.elAdaptersContainer.replaceChildren(empty);
+      this.adapterCards.clear();
+      this.elChartLegend.replaceChildren();
       return;
     }
 
-    let html = '';
+    const empty = this.elAdaptersContainer.querySelector('.loading-state');
+    if (empty) empty.remove();
+
+    const activeIps = new Set(adapters.map(adapter => adapter.ip));
+    this.adapterCards.forEach((card, ip) => {
+      if (!activeIps.has(ip)) {
+        card.element.remove();
+        this.adapterCards.delete(ip);
+      }
+    });
+
+    const legendNodes = document.createDocumentFragment();
+    const totalLegend = document.createElement('div');
+    totalLegend.className = 'legend-item';
+    const totalColor = document.createElement('div');
+    totalColor.className = 'legend-color';
+    totalColor.style.background = '#ffffff';
+    const totalLabel = document.createElement('span');
+    totalLabel.textContent = 'Total Bonded';
+    totalLegend.append(totalColor, totalLabel);
+    legendNodes.append(totalLegend);
+
     adapters.forEach((adapter, idx) => {
       const color = this.colorPalette[idx % this.colorPalette.length];
       const icon = adapter.is_wifi ? 'fa-wifi' : (adapter.is_cellular ? 'fa-tower-cell' : 'fa-ethernet');
       const typeLabel = adapter.is_wifi ? 'Wi-Fi' : (adapter.is_cellular ? 'Cellular / USB' : 'Ethernet');
-      const descHtml = adapter.description ? `<div class="adapter-desc">${adapter.description}</div>` : '';
-      const isChecked = adapter.enabled ? 'checked' : '';
-      const activeClass = adapter.enabled ? 'active' : 'disabled';
-      const speedTotal = (adapter.download_speed_mbps + adapter.upload_speed_mbps).toFixed(2);
+      let card = this.adapterCards.get(adapter.ip);
+      if (!card) {
+        card = this.createAdapterCard(adapter.ip);
+        this.adapterCards.set(adapter.ip, card);
+      }
+      this.updateAdapterCard(card, adapter, color, icon, typeLabel);
+      const current = this.elAdaptersContainer.children[idx];
+      if (current !== card.element) {
+        this.elAdaptersContainer.insertBefore(card.element, current || null);
+      }
 
-      html += `
-        <div class="adapter-item ${activeClass}" data-ip="${adapter.ip}">
-          <div class="adapter-header">
-            <div class="adapter-title-group">
-              <div class="adapter-type-icon" style="color: ${color}">
-                <i class="fa-solid ${icon}"></i>
-              </div>
-              <div>
-                <div class="adapter-name">${adapter.name} <span class="adapter-badge">${typeLabel}</span></div>
-                ${descHtml}
-                <div class="adapter-ip">${adapter.ip}</div>
-              </div>
-            </div>
-            
-            <label class="switch">
-              <input type="checkbox" class="adapter-toggle-input" data-ip="${adapter.ip}" ${isChecked}>
-              <span class="slider"></span>
-            </label>
-          </div>
-
-          <div class="adapter-stats-grid">
-            <div class="stat-cell">
-              <span class="stat-cell-lbl">Speed</span>
-              <span class="stat-cell-val" style="color: ${color}">${speedTotal} Mbps</span>
-            </div>
-            <div class="stat-cell">
-              <span class="stat-cell-lbl">Latency</span>
-              <span class="stat-cell-val">${adapter.latency_ms.toFixed(0)} ms</span>
-            </div>
-            <div class="stat-cell">
-              <span class="stat-cell-lbl">Loss</span>
-              <span class="stat-cell-val">${adapter.loss_pct.toFixed(1)}%</span>
-            </div>
-          </div>
-        </div>
-      `;
+      const legend = document.createElement('div');
+      legend.className = 'legend-item';
+      const swatch = document.createElement('div');
+      swatch.className = 'legend-color';
+      swatch.style.background = color;
+      const legendLabel = document.createElement('span');
+      legendLabel.textContent = (adapter.name || 'Adapter').split(' ')[0];
+      legend.append(swatch, legendLabel);
+      legendNodes.append(legend);
     });
 
-    this.elAdaptersContainer.innerHTML = html;
+    this.elChartLegend.replaceChildren(legendNodes);
+  }
 
-    // Attach Toggle Listeners
-    const toggles = this.elAdaptersContainer.querySelectorAll('.adapter-toggle-input');
-    toggles.forEach(toggle => {
-      toggle.addEventListener('change', async (e) => {
-        const ip = e.target.getAttribute('data-ip');
-        const enabled = e.target.checked;
-        try {
-          await fetch('/api/adapter/toggle', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ ip, enabled })
-          });
-        } catch (err) {
-          console.error('Failed to toggle adapter:', err);
-        }
-      });
-    });
+  createAdapterCard(ip) {
+    const item = document.createElement('div');
+    item.className = 'adapter-item';
+    item.dataset.ip = ip;
 
-    // Update Chart Legend
-    let legendHtml = '<div class="legend-item"><div class="legend-color" style="background: #ffffff"></div><span>Total Bonded</span></div>';
-    adapters.forEach((adapter, idx) => {
-      const color = this.colorPalette[idx % this.colorPalette.length];
-      legendHtml += `<div class="legend-item"><div class="legend-color" style="background: ${color}"></div><span>${adapter.name.split(' ')[0]}</span></div>`;
-    });
-    this.elChartLegend.innerHTML = legendHtml;
+    const header = document.createElement('div');
+    header.className = 'adapter-header';
+    const titleGroup = document.createElement('div');
+    titleGroup.className = 'adapter-title-group';
+    const typeIcon = document.createElement('div');
+    typeIcon.className = 'adapter-type-icon';
+    const iconElement = document.createElement('i');
+    typeIcon.append(iconElement);
+    const details = document.createElement('div');
+    const name = document.createElement('div');
+    name.className = 'adapter-name';
+    const nameText = document.createElement('span');
+    const badge = document.createElement('span');
+    badge.className = 'adapter-badge';
+    name.append(nameText, badge);
+    const description = document.createElement('div');
+    description.className = 'adapter-desc';
+    const address = document.createElement('div');
+    address.className = 'adapter-ip';
+    details.append(name, description, address);
+    titleGroup.append(typeIcon, details);
+
+    const label = document.createElement('label');
+    label.className = 'switch';
+    const toggle = document.createElement('input');
+    toggle.type = 'checkbox';
+    toggle.className = 'adapter-toggle-input';
+    toggle.dataset.ip = ip;
+    const slider = document.createElement('span');
+    slider.className = 'slider';
+    label.append(toggle, slider);
+    header.append(titleGroup, label);
+
+    const stats = document.createElement('div');
+    stats.className = 'adapter-stats-grid';
+    const statValues = [];
+    const statLabels = ['Speed', 'Latency', 'Loss'];
+    for (let index = 0; index < 3; index += 1) {
+      const cell = document.createElement('div');
+      cell.className = 'stat-cell';
+      const labelElement = document.createElement('span');
+      labelElement.className = 'stat-cell-lbl';
+      labelElement.textContent = statLabels[index];
+      const valueElement = document.createElement('span');
+      valueElement.className = 'stat-cell-val';
+      cell.append(labelElement, valueElement);
+      stats.append(cell);
+      statValues.push(valueElement);
+    }
+    item.append(header, stats);
+    return { element: item, iconElement, typeIcon, nameText, badge, description, address, toggle, statValues };
+  }
+
+  updateAdapterCard(card, adapter, color, icon, typeLabel) {
+    const speedTotal = (adapter.download_speed_mbps + adapter.upload_speed_mbps).toFixed(2);
+    const pending = this.pendingAdapterToggles.has(adapter.ip);
+    card.element.className = `adapter-item ${adapter.enabled ? 'active' : 'disabled'}`;
+    card.typeIcon.style.color = color;
+    card.iconElement.className = `fa-solid ${icon}`;
+    card.nameText.textContent = adapter.name || 'Unknown adapter';
+    card.badge.textContent = typeLabel;
+    card.description.textContent = adapter.description || '';
+    card.description.hidden = !adapter.description;
+    card.address.textContent = adapter.ip;
+    card.toggle.checked = pending
+      ? this.pendingAdapterToggles.get(adapter.ip)
+      : adapter.enabled;
+    card.toggle.disabled = pending;
+    card.statValues[0].textContent = `${speedTotal} Mbps`;
+    card.statValues[0].style.color = color;
+    card.statValues[1].textContent = `${adapter.latency_ms.toFixed(0)} ms`;
+    card.statValues[1].style.color = '';
+    card.statValues[2].textContent = `${adapter.loss_pct.toFixed(1)}%`;
+    card.statValues[2].style.color = '';
   }
 
   async refreshAdapters() {

@@ -9,6 +9,7 @@ import select
 import time
 import logging
 import random
+import platform
 import threading
 from typing import Dict, List, Tuple, Optional
 
@@ -20,21 +21,32 @@ from core.socket_bind import create_bound_udp_socket
 from core.prober import LinkProber
 from core.scheduler import PacketScheduler, BondingMode
 from core.tun.wintun import WintunInterface
+from core.tun.routes import PhysicalPath, TunnelNetworkConfig
+from core.secret import load_secret
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("MySpeedify.Client")
+MAX_IO_WAIT = 0.05
+TUN_READ_BATCH = 64
 
 class ClientDaemon:
     def __init__(
         self,
         server_host: str = "127.0.0.1",
         server_port: int = 51820,
-        passphrase: str = "myspeedify_secret_key_2026",
+        passphrase: Optional[str] = None,
         mode: BondingMode = BondingMode.SPEED
     ):
+        if passphrase is None:
+            passphrase = load_secret()
+        if not passphrase:
+            raise ValueError(
+                "A tunnel passphrase is required via the constructor or "
+                "MYSPEEDIFY_SECRET/MYSPEEDIFY_SECRET_FILE."
+            )
         self.server_host = server_host
         self.server_port = server_port
-        self.server_addr = (server_host, server_port)
+        self.server_addr: Optional[Tuple[str, int]] = None
         
         self.session_id: int = random.randint(100000, 999999)
         self.crypto = TunnelCrypto.from_passphrase(passphrase)
@@ -42,7 +54,12 @@ class ClientDaemon:
         self.prober = LinkProber(interval_seconds=0.4)
         self.scheduler = PacketScheduler(prober=self.prober, mode=mode)
         self.reorder_buffer = ReorderBuffer(max_buffer_size=2048, max_hold_time_ms=30.0)
-        self.tun = WintunInterface()
+        if platform.system() == "Linux":
+            from core.tun.linux import LinuxTun
+            self.tun = LinuxTun()
+        else:
+            self.tun = WintunInterface()
+        self.network_config: Optional[TunnelNetworkConfig] = None
         
         # Sockets keyed by path_id (1-indexed)
         # path_id -> (socket, NetworkAdapter)
@@ -51,6 +68,9 @@ class ClientDaemon:
         self.seq_counter: int = 0
         self.is_running: bool = False
         self.is_connected: bool = False
+        self._dns_stop = threading.Event()
+        self._dns_thread: Optional[threading.Thread] = None
+        self._tun_drain_pending = False
         
         # Telemetry stats
         self.start_time: float = time.time()
@@ -66,11 +86,53 @@ class ClientDaemon:
 
     def start(self):
         """Initializes sockets, TUN interface, and starts the processing loop in a background thread"""
-        logger.info(f"Starting MySpeedify Client (Session: {self.session_id}) -> Target: {self.server_addr}")
-        self.tun.open(ip="10.8.0.2")
-        self.refresh_paths()
+        logger.info(
+            "Starting MySpeedify Client (Session: %s) -> Target: %s:%s",
+            self.session_id, self.server_host, self.server_port,
+        )
+        if self.is_running:
+            return
+        if platform.system() not in ("Windows", "Linux"):
+            raise RuntimeError(
+                f"Legacy full-tunnel routing is unsupported on {platform.system()}"
+            )
+
+        network_config = None
+        try:
+            self.refresh_paths()
+            self._resolve_server_addr()
+            if self.server_addr is None:
+                raise RuntimeError("Cannot enable the tunnel before resolving the relay")
+            if not self.tun.open(ip="10.8.0.2"):
+                raise RuntimeError("Could not open the tunnel interface")
+            physical_paths = [
+                PhysicalPath(adapter.interface_name, adapter.ip, adapter.if_index)
+                for _, adapter in self.paths.values()
+            ]
+            network_config = TunnelNetworkConfig(
+                self.tun, self.server_addr[0], physical_paths,
+            )
+            network_config.install()
+        except Exception:
+            if network_config:
+                try:
+                    network_config.close()
+                except Exception:
+                    self.network_config = network_config
+                    logger.exception("Could not roll back legacy tunnel network settings")
+            try:
+                self.tun.close()
+            except Exception:
+                logger.exception("Could not close the legacy tunnel after startup failure")
+            self._close_path_sockets()
+            raise
+
+        self.network_config = network_config
         self.is_running = True
         self.is_connected = True
+        self._dns_stop.clear()
+        self._dns_thread = threading.Thread(target=self._dns_loop, daemon=True)
+        self._dns_thread.start()
         
         # Start high-performance dedicated background worker thread
         self._worker_thread = threading.Thread(target=self._background_loop, daemon=True)
@@ -84,9 +146,8 @@ class ClientDaemon:
                     self.refresh_paths()
                     self.last_adapter_scan_time = now
                 self.step()
-                time.sleep(0.005)
-            except Exception as e:
-                logger.debug(f"Daemon worker loop error: {e}")
+            except Exception:
+                logger.exception("Daemon worker loop error")
                 time.sleep(0.02)
 
     def _init_paths(self):
@@ -100,6 +161,13 @@ class ClientDaemon:
         # 1. Remove paths for adapters that no longer exist
         for pid, (sock, adp) in list(self.paths.items()):
             if adp.ip not in new_adapter_ips:
+                if self.network_config:
+                    try:
+                        self.network_config.remove_path(PhysicalPath(
+                            adp.interface_name, adp.ip, adp.if_index,
+                        ))
+                    except Exception:
+                        logger.exception("Could not remove route for adapter %s", adp.name)
                 try:
                     sock.close()
                 except Exception:
@@ -113,7 +181,16 @@ class ClientDaemon:
             if adapter.ip not in existing_ips:
                 next_idx = max(self.paths.keys(), default=0) + 1
                 try:
-                    sock = create_bound_udp_socket(local_ip=adapter.ip, port=0)
+                    sock = create_bound_udp_socket(
+                        local_ip=adapter.ip,
+                        port=0,
+                        interface_name=adapter.interface_name,
+                        if_index=adapter.if_index,
+                    )
+                    if self.network_config:
+                        self.network_config.add_path(PhysicalPath(
+                            adapter.interface_name, adapter.ip, adapter.if_index,
+                        ))
                     self.paths[next_idx] = (sock, adapter)
                     logger.info(f"Initialized Path #{next_idx} on [{adapter.name}] ({adapter.ip})")
                 except Exception as e:
@@ -144,44 +221,80 @@ class ClientDaemon:
             return True
         return False
 
-    def get_server_addr(self) -> Tuple[str, int]:
-        """Resolves dynamic DDNS hostnames (e.g. arghire.go.ro) to target IP address"""
-        now = time.time()
-        if not hasattr(self, '_resolved_ip') or (now - getattr(self, '_last_dns_time', 0)) > 15.0:
-            try:
-                self._resolved_ip = socket.gethostbyname(self.server_host)
-                self._last_dns_time = now
-            except Exception:
-                if not hasattr(self, '_resolved_ip'):
-                    self._resolved_ip = self.server_host
-        return (self._resolved_ip, self.server_port)
+    def _dns_loop(self):
+        while self.is_running:
+            self._resolve_server_addr()
+            if self._dns_stop.wait(15.0):
+                break
+
+    def _resolve_server_addr(self):
+        try:
+            resolved_ip = socket.gethostbyname(self.server_host)
+        except OSError as e:
+            logger.warning("Could not resolve relay host %s: %s", self.server_host, e)
+            return
+
+        resolved_addr = (resolved_ip, self.server_port)
+        if resolved_addr != self.server_addr:
+            if self.network_config:
+                try:
+                    self.network_config.update_relay(resolved_ip)
+                except Exception:
+                    logger.exception("Could not update relay exception route to %s", resolved_ip)
+                    return
+            logger.info("Relay host %s resolved to %s", self.server_host, resolved_ip)
+            self.server_addr = resolved_addr
+
+    def get_server_addr(self) -> Optional[Tuple[str, int]]:
+        """Returns the latest address resolved by the background DNS worker."""
+        return self.server_addr
 
     def step(self):
         """Single non-blocking iteration of the packet I/O engine"""
         if not self.is_running:
             return
 
-        now = time.time()
-        
         # 1. Check if prober needs to send latency/jitter probes
         if self.prober.should_probe():
             active_path_ids = [pid for pid, (_, adp) in self.paths.items() if adp.enabled]
-            probes = self.prober.generate_probes(active_path_ids, self.session_id)
             target_addr = self.get_server_addr()
-            for path_id, pkt in probes:
-                if path_id in self.paths:
-                    sock, adapter = self.paths[path_id]
-                    raw_bytes = pkt.serialize()
-                    try:
-                        sock.sendto(raw_bytes, target_addr)
-                    except Exception as e:
-                        logger.debug(f"Probe send error on path {path_id}: {e}")
+            if target_addr is not None:
+                probes = self.prober.generate_probes(active_path_ids, self.session_id)
+                for path_id, pkt in probes:
+                    if path_id in self.paths:
+                        sock, adapter = self.paths[path_id]
+                        raw_bytes = pkt.serialize()
+                        try:
+                            sock.sendto(raw_bytes, target_addr)
+                        except Exception as e:
+                            logger.debug(f"Probe send error on path {path_id}: {e}")
 
         # 2. Ingress: Read incoming UDP packets across all active physical sockets
         read_sockets = [sock for sock, adp in self.paths.values() if adp.enabled]
+        tun_wait_socket = getattr(self.tun, "read_wait_socket", None)
+        if not isinstance(tun_wait_socket, socket.socket):
+            tun_wait_socket = None
+        tun_wait_handle = tun_wait_socket if tun_wait_socket is not None else self.tun
+        tun_readiness = getattr(self.tun, "supports_readiness", None)
+        tun_selectable = (
+            tun_wait_socket is not None
+            or (
+                bool(tun_readiness)
+                if tun_readiness is not None
+                else callable(getattr(self.tun, "fileno", None))
+            )
+        )
+        if tun_selectable:
+            read_sockets.append(tun_wait_handle)
         if read_sockets:
-            readable, _, _ = select.select(read_sockets, [], [], 0.002)
+            timeout = 0.0 if self._tun_drain_pending else MAX_IO_WAIT
+            reorder_timeout = self.reorder_buffer.time_until_expiry()
+            if reorder_timeout is not None:
+                timeout = min(timeout, reorder_timeout)
+            readable, _, _ = select.select(read_sockets, [], [], timeout)
             for sock in readable:
+                if tun_selectable and sock is tun_wait_handle:
+                    continue
                 # Find path_id and adapter
                 path_id = None
                 adapter = None
@@ -201,6 +314,8 @@ class ClientDaemon:
                     pass
                 except Exception as e:
                     logger.debug(f"Socket recv error: {e}")
+        else:
+            time.sleep(MAX_IO_WAIT)
 
         # 3. Flush expired packets from reorder buffer to virtual TUN
         ready_payloads = self.reorder_buffer.flush_expired()
@@ -208,9 +323,19 @@ class ClientDaemon:
             self.tun.write(payload)
 
         # 4. Egress: Read raw IP packets from virtual TUN and bond them out
-        tun_pkt = self.tun.read()
-        if tun_pkt:
-            self._handle_egress_packet(tun_pkt)
+        if (
+            not tun_selectable
+            or tun_wait_handle in readable
+            or self._tun_drain_pending
+        ):
+            self._tun_drain_pending = False
+            for _ in range(TUN_READ_BATCH):
+                tun_pkt = self.tun.read()
+                if not tun_pkt:
+                    break
+                self._handle_egress_packet(tun_pkt)
+            else:
+                self._tun_drain_pending = True
 
         # 5. Periodic telemetry update
         self._update_telemetry()
@@ -246,12 +371,15 @@ class ClientDaemon:
                 logger.debug(f"Decryption error on seq {pkt.seq_num}: {e}")
 
     def _handle_egress_packet(self, ip_payload: bytes):
-        self.seq_counter += 1
-        seq = self.seq_counter
-        
         active_paths = [(pid, adp) for pid, (_, adp) in self.paths.items() if adp.enabled]
         if not active_paths:
             return
+        target_addr = self.get_server_addr()
+        if target_addr is None:
+            return
+
+        self.seq_counter += 1
+        seq = self.seq_counter
 
         # Schedule packet across paths
         scheduled = self.scheduler.schedule(
@@ -261,7 +389,6 @@ class ClientDaemon:
             active_adapters=active_paths
         )
 
-        target_addr = self.get_server_addr()
         for path_id, pkt in scheduled:
             encrypted_payload = self.crypto.encrypt(ip_payload, seq, path_id)
             pkt.payload = encrypted_payload
@@ -281,9 +408,8 @@ class ClientDaemon:
         now = time.time()
         elapsed = now - self.last_rate_time
         if elapsed >= 0.5:
-            # Update each adapter rate — update_rates() reads psutil directly, no args needed
             for _, adapter in self.paths.values():
-                adapter.update_rates()
+                adapter.update_rates(adapter.total_tx_bytes, adapter.total_rx_bytes)
                 
             total_up_bps = sum(adp.upload_speed_bps for _, adp in self.paths.values() if adp.enabled)
             total_down_bps = sum(adp.download_speed_bps for _, adp in self.paths.values() if adp.enabled)
@@ -323,10 +449,36 @@ class ClientDaemon:
     def stop(self):
         self.is_running = False
         self.is_connected = False
-        self.tun.close()
-        for sock, _ in self.paths.values():
+        self._dns_stop.set()
+        if self._dns_thread and self._dns_thread is not threading.current_thread():
+            self._dns_thread.join(timeout=1.0)
+        worker_thread = getattr(self, "_worker_thread", None)
+        if worker_thread and worker_thread is not threading.current_thread():
+            worker_thread.join(timeout=1.0)
+        cleanup_error = None
+        if self.network_config:
+            try:
+                self.network_config.close()
+                self.network_config = None
+            except Exception as e:
+                cleanup_error = e
+                logger.exception("Could not restore legacy tunnel network settings")
+        try:
+            self.tun.close()
+        except Exception as e:
+            cleanup_error = cleanup_error or e
+            logger.exception("Could not close the legacy tunnel interface")
+        self._close_path_sockets()
+        logger.info("MySpeedify Client stopped.")
+        if cleanup_error:
+            raise RuntimeError(
+                f"Could not restore legacy tunnel network settings: {cleanup_error}"
+            ) from cleanup_error
+
+    def _close_path_sockets(self):
+        for sock, _ in list(self.paths.values()):
             try:
                 sock.close()
             except Exception:
-                pass
-        logger.info("MySpeedify Client stopped.")
+                logger.exception("Could not close a legacy path socket")
+        self.paths.clear()

@@ -9,5 +9,5 @@ def create_tun() -> BaseTunInterface:
     if system == "Linux":
         from .linux import LinuxTun
         return LinuxTun(name="msp0")
-    from .wintun import WintunInterface  # Windows (or dev loopback when MYSPEEDIFY_DEV=1)
+    from .wintun_v2 import WintunInterface  # Windows (or dev loopback when MYSPEEDIFY_DEV=1)
     return WintunInterface()

@@ -5,8 +5,8 @@ from unittest import mock
 
 from cryptography.exceptions import InvalidTag
 
-from core.crypto import derive_psk
-from core.handshake import ClientHandshake, parse_init, build_resp
+from core.crypto_v2 import derive_psk
+from core.handshake import ClientHandshake, parse_init, parse_init_client_id, build_resp
 
 SECRET = "unit-test-secret-0123456789"
 
@@ -64,6 +64,38 @@ class TestHandshake(unittest.TestCase):
         self.assertIsNone(parse_init(psk, 2, init))
         with mock.patch("core.handshake.time.time", return_value=time.time() + 3600):
             self.assertIsNone(parse_init(psk, 1, init))
+
+    def test_client_identity_is_included_in_authenticated_init(self):
+        psk = derive_psk(SECRET)
+        client = ClientHandshake(psk, 1, client_id="alice")
+        init = client.build_init()
+
+        self.assertEqual(parse_init_client_id(init), "alice")
+        parsed = parse_init(psk, 1, init)
+        if parsed is None:
+            self.fail("Per-client INIT failed authentication")
+        self.assertIsNone(parse_init(derive_psk("different-client-secret"), 1, init))
+        tampered = b"\x05alixe" + init[6:]
+        self.assertIsNone(parse_init(psk, 1, tampered))
+        cpub, cnonce = parsed
+        response, server_crypto = build_resp(psk, 1, cpub, cnonce, "10.8.0.2")
+        processed = client.process_resp(response)
+        if processed is None:
+            self.fail("Per-client handshake response failed authentication")
+        client_crypto, tunnel_ip = processed
+        self.assertEqual(tunnel_ip, "10.8.0.2")
+        aad = b"H" * 20
+        ciphertext = client_crypto.encrypt(b"client data", 1, 1, 0x10, aad)
+        self.assertEqual(
+            server_crypto.decrypt(ciphertext, 1, 1, 0x10, aad),
+            b"client data",
+        )
+
+    def test_legacy_init_has_no_client_identity(self):
+        init = ClientHandshake(derive_psk(SECRET), 1).build_init()
+
+        self.assertIsNone(parse_init_client_id(init))
+        self.assertIsNotNone(parse_init(derive_psk(SECRET), 1, init))
 
     def test_short_secret_refused(self):
         with self.assertRaises(ValueError):

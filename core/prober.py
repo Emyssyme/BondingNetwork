@@ -19,6 +19,7 @@ class PathMetrics:
         self.sent_probes: Dict[int, float] = {}  # probe_seq -> send_timestamp
         self.total_probes_sent: int = 0
         self.total_probes_lost: int = 0
+        self.probe_outcomes: deque[bool] = deque(maxlen=window_size)
         
         # Computed metrics
         self.avg_rtt_ms: float = 20.0
@@ -26,10 +27,13 @@ class PathMetrics:
         self.jitter_ms: float = 1.0
         self.loss_rate: float = 0.0
         self.weight: float = 1.0
-        self.last_alive: float = time.time()
+        self.first_probe_sent_at: float = 0.0
+        self.last_alive: float = 0.0
 
     def record_probe_sent(self, probe_seq: int) -> bytes:
-        now = time.time()
+        now = time.monotonic()
+        if not self.first_probe_sent_at:
+            self.first_probe_sent_at = now
         self.sent_probes[probe_seq] = now
         self.total_probes_sent += 1
         
@@ -39,17 +43,19 @@ class PathMetrics:
         for k in stale_keys:
             del self.sent_probes[k]
             self.total_probes_lost += 1
+            self.probe_outcomes.append(False)
             
-        self._update_loss_rate()
-        return ProbeData.encode(send_time=now, probe_index=probe_seq)
+        self._update_metrics()
+        return ProbeData.encode(send_time=time.time(), probe_index=probe_seq)
 
     def record_probe_response(self, probe_data: bytes) -> float:
-        now = time.time()
-        self.last_alive = now
-        send_time, probe_seq, _ = ProbeData.decode(probe_data)
+        now = time.monotonic()
+        probe_seq = ProbeData.decode(probe_data)[1]
         
         if probe_seq in self.sent_probes:
             orig_send_time = self.sent_probes.pop(probe_seq)
+            self.last_alive = now
+            self.probe_outcomes.append(True)
             rtt = (now - orig_send_time) * 1000.0  # ms
             self.rtt_history.append(rtt)
             self._update_metrics()
@@ -57,28 +63,31 @@ class PathMetrics:
         return 0.0
 
     def _update_loss_rate(self):
-        recent_total = min(self.total_probes_sent, self.window_size)
-        if recent_total > 0:
-            self.loss_rate = min(1.0, len(self.sent_probes) / recent_total)
+        if self.probe_outcomes:
+            lost = sum(not received for received in self.probe_outcomes)
+            self.loss_rate = lost / len(self.probe_outcomes)
         else:
             self.loss_rate = 0.0
 
     def _update_metrics(self):
-        if not self.rtt_history:
-            return
-            
-        self.avg_rtt_ms = sum(self.rtt_history) / len(self.rtt_history)
-        self.min_rtt_ms = min(self.rtt_history)
-        
-        # Compute RFC 3550 style jitter
-        if len(self.rtt_history) >= 2:
-            diffs = [abs(self.rtt_history[i] - self.rtt_history[i - 1]) for i in range(1, len(self.rtt_history))]
-            self.jitter_ms = sum(diffs) / len(diffs)
+        if self.rtt_history:
+            self.avg_rtt_ms = sum(self.rtt_history) / len(self.rtt_history)
+            self.min_rtt_ms = min(self.rtt_history)
+
+            # Compute RFC 3550 style jitter
+            if len(self.rtt_history) >= 2:
+                diffs = [
+                    abs(self.rtt_history[i] - self.rtt_history[i - 1])
+                    for i in range(1, len(self.rtt_history))
+                ]
+                self.jitter_ms = sum(diffs) / len(diffs)
             
         self._update_loss_rate()
+        if not self.rtt_history and not self.probe_outcomes:
+            return
         
         # Dynamic link weight: higher weight = faster/lower latency and lower loss
-        # Weight ~ 1 / (avg_rtt * (1 + 10 * loss_rate))
+        # Weight ~ 1 / (avg_rtt * (1 + 5 * loss_rate))
         effective_rtt = max(1.0, self.avg_rtt_ms) * (1.0 + 5.0 * self.loss_rate)
         self.weight = max(0.1, min(10.0, 100.0 / effective_rtt))
 
@@ -86,7 +95,7 @@ class PathMetrics:
 class LinkProber:
     def __init__(self, interval_seconds: float = 0.5):
         self.interval: float = interval_seconds
-        self.last_probe_time: float = 0.0
+        self.last_probe_time: Optional[float] = None
         self.probe_seq_counter: int = 1
         self.paths: Dict[int, PathMetrics] = {}
 
@@ -96,11 +105,14 @@ class LinkProber:
         return self.paths[path_id]
 
     def should_probe(self) -> bool:
-        return (time.time() - self.last_probe_time) >= self.interval
+        return (
+            self.last_probe_time is None
+            or time.monotonic() - self.last_probe_time >= self.interval
+        )
 
     def generate_probes(self, active_path_ids: list[int], session_id: int) -> list[Tuple[int, Packet]]:
         """Generates probe request packets for all active paths"""
-        now = time.time()
+        now = time.monotonic()
         self.last_probe_time = now
         packets = []
         

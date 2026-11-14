@@ -41,6 +41,7 @@ class PacketFlag(IntEnum):
     URGENT = 0x02         # Low-latency packet (DNS, TCP SYN/ACK, VoIP)
     PROBE = 0x04          # Diagnostic probe packet
     COMPRESSED = 0x08     # Compressed payload
+    FAILOVER = 0x10       # Client requests primary/standby downlink scheduling
 
 class Packet:
     __slots__ = (

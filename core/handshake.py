@@ -22,11 +22,13 @@ from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
-from .crypto import TunnelCrypto, DIR_C2S, DIR_S2C
+from .crypto_v2 import TunnelCrypto, DIR_C2S, DIR_S2C
+from .secret import is_valid_client_id
 
 _INIT = struct.Struct("!32s16sQ")
 _RESP = struct.Struct("!32s16s4s")
 _MAC = 32
+INIT_LEGACY_SIZE = _INIT.size + _MAC
 MAX_SKEW_MS = 300_000  # INIT timestamp tolerance (5 min)
 
 
@@ -57,15 +59,23 @@ def _keys(psk: bytes, shared: bytes, cnonce: bytes, snonce: bytes, sid: int) -> 
 
 
 class ClientHandshake:
-    def __init__(self, psk: bytes, session_id: int):
+    def __init__(self, psk: bytes, session_id: int, client_id: str | None = None):
+        if client_id is not None and not is_valid_client_id(client_id):
+            raise ValueError("Client ID must use 1-64 letters, digits, '.', '_' or '-'")
         self.psk = psk
         self.session_id = session_id
+        self.client_id = client_id
         self._priv = X25519PrivateKey.generate()
         self._pub = _pub(self._priv)
         self._nonce = os.urandom(16)
 
     def build_init(self) -> bytes:
-        body = _INIT.pack(self._pub, self._nonce, int(time.time() * 1000))
+        init_body = _INIT.pack(self._pub, self._nonce, int(time.time() * 1000))
+        if self.client_id is None:
+            body = init_body
+        else:
+            client_id = self.client_id.encode("ascii")
+            body = bytes((len(client_id),)) + client_id + init_body
         return body + _mac(self.psk, b"init", struct.pack("!I", self.session_id), body)
 
     def process_resp(self, payload: bytes) -> Optional[Tuple[TunnelCrypto, str]]:
@@ -85,16 +95,39 @@ class ClientHandshake:
 
 def parse_init(psk: bytes, session_id: int, payload: bytes) -> Optional[Tuple[bytes, bytes]]:
     """Relay side. Returns (client_pub, client_nonce) only if the MAC and timestamp are valid."""
-    if len(payload) != _INIT.size + _MAC:
+    if len(payload) == INIT_LEGACY_SIZE:
+        body = payload[:-_MAC]
+        init_body = body
+    else:
+        client_id = parse_init_client_id(payload)
+        if client_id is None:
+            return None
+        body = payload[:-_MAC]
+        init_body = payload[1 + len(client_id):-_MAC]
+    if len(init_body) != _INIT.size:
         return None
-    body, mac = payload[:-_MAC], payload[-_MAC:]
+    mac = payload[-_MAC:]
     expected = _mac(psk, b"init", struct.pack("!I", session_id), body)
     if not hmac.compare_digest(mac, expected):
         return None
-    cpub, cnonce, ts_ms = _INIT.unpack(body)
+    cpub, cnonce, ts_ms = _INIT.unpack(init_body)
     if abs(int(time.time() * 1000) - ts_ms) > MAX_SKEW_MS:
         return None
     return cpub, cnonce
+
+
+def parse_init_client_id(payload: bytes) -> Optional[str]:
+    """Return the client ID from a well-formed per-client INIT, or None."""
+    if len(payload) == INIT_LEGACY_SIZE or len(payload) < INIT_LEGACY_SIZE + 2:
+        return None
+    id_length = payload[0]
+    if not 1 <= id_length <= 64 or len(payload) != 1 + id_length + INIT_LEGACY_SIZE:
+        return None
+    try:
+        client_id = payload[1:1 + id_length].decode("ascii")
+    except UnicodeDecodeError:
+        return None
+    return client_id if is_valid_client_id(client_id) else None
 
 
 def build_resp(psk: bytes, session_id: int, cpub: bytes, cnonce: bytes,
