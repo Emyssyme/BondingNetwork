@@ -16,8 +16,9 @@ class FakeIptables:
             ("ip6tables", "filter", "FORWARD"): ["-A FORWARD -j EXISTING_IPV6"],
         }
         self.fail_once_on = None
+        self.incompatible_chain_queries = set()
 
-    def run(self, command, capture_output, text):
+    def run(self, command, check, capture_output, text):
         tool, _, _, table, *args = command
         op = args[0]
         if self.fail_once_on == (tool, table, tuple(args)):
@@ -25,6 +26,19 @@ class FakeIptables:
             return subprocess.CompletedProcess(command, 1, "", "injected failure")
 
         if op == "-S":
+            if len(args) > 1 and (tool, table, args[1]) in self.incompatible_chain_queries:
+                return subprocess.CompletedProcess(
+                    command, 1, "", "iptables: Incompatible with this kernel.",
+                )
+            if len(args) == 1:
+                lines = []
+                for (chain_tool, chain_table, chain), rules in self.chains.items():
+                    if chain_tool != tool or chain_table != table:
+                        continue
+                    if chain not in {"INPUT", "FORWARD", "POSTROUTING"}:
+                        lines.append(f"-N {chain}")
+                    lines.extend(rules)
+                return subprocess.CompletedProcess(command, 0, "\n".join(lines), "")
             chain = args[1]
             rules = self.chains.get((tool, table, chain))
             if rules is None:
@@ -53,6 +67,14 @@ class FakeIptables:
             expected = "-A " + chain + " " + shlex.join(args[2:])
             if expected in self.chains.get((tool, table, chain), []):
                 return subprocess.CompletedProcess(command, 0, "", "")
+            if (
+                len(args) >= 4
+                and args[-2] == "-j"
+                and (tool, table, args[-1]) not in self.chains
+            ):
+                return subprocess.CompletedProcess(
+                    command, 1, "", f"iptables: Chain '{args[-1]}' does not exist",
+                )
             return subprocess.CompletedProcess(
                 command, 1, "", "Bad rule (does a matching rule exist in that chain?)",
             )
@@ -157,6 +179,26 @@ class TestLinuxFirewall(unittest.TestCase):
             self.runner.chains[("iptables", "filter", "INPUT")],
         )
 
+    def test_inspects_full_table_when_named_chain_query_is_incompatible(self):
+        self.runner.incompatible_chain_queries.add(
+            ("iptables", "nat", "MSP_POSTROUTING"),
+        )
+
+        self.firewall.install()
+        self.firewall.install()
+
+        nat_rules = self.runner.chains[("iptables", "nat", "MSP_POSTROUTING")]
+        self.assertIn(
+            "-A MSP_POSTROUTING -s 10.8.0.0/24 -o eth0 -j MASQUERADE",
+            nat_rules,
+        )
+        self.assertTrue(any(OWNER_MARKER in rule for rule in nat_rules))
+
+    def test_missing_jump_target_is_treated_as_not_inserted(self):
+        nat_spec = self.firewall._chain_specs()[2]
+
+        self.assertFalse(self.firewall._jump_exists(nat_spec))
+
     def test_remove_preserves_jump_to_an_unowned_chain(self):
         self.runner.chains[("iptables", "filter", "MSP_FORWARD")] = [
             "-A MSP_FORWARD -j ACCEPT",
@@ -216,6 +258,44 @@ class TestLinuxFirewall(unittest.TestCase):
             self.runner.chains[("iptables", "filter", "FORWARD")],
             ["-A FORWARD -j EXISTING_FORWARD"],
         )
+
+    def test_failed_install_reports_rollback_failure(self):
+        self.runner.fail_once_on = (
+            "iptables", "filter",
+            ("-A", "MSP_FORWARD", "-i", "msps0", "!", "-s", "10.8.0.0/24", "-j", "DROP"),
+        )
+
+        with patch.object(
+            self.firewall,
+            "_restore_chain",
+            side_effect=RuntimeError("injected rollback failure"),
+        ), self.assertRaisesRegex(
+            RuntimeError, "rollback failed.*injected rollback failure",
+        ):
+            self.firewall.install()
+
+    def test_failed_owned_chain_update_reports_restore_failure(self):
+        spec = next(
+            item for item in self.firewall._chain_specs()
+            if item.chain == "MSP_FORWARD"
+        )
+        self.runner.chains[("iptables", "filter", "MSP_FORWARD")] = [
+            f"-A MSP_FORWARD -m comment --comment {OWNER_MARKER} -j RETURN",
+            "-A MSP_FORWARD -j ACCEPT",
+        ]
+        self.runner.fail_once_on = (
+            "iptables", "filter",
+            ("-A", "MSP_FORWARD", "-i", "msps0", "!", "-s", "10.8.0.0/24", "-j", "DROP"),
+        )
+
+        with patch.object(
+            self.firewall,
+            "_restore_chain",
+            side_effect=RuntimeError("injected restore failure"),
+        ), self.assertRaisesRegex(
+            RuntimeError, "after installation failed.*injected restore failure",
+        ):
+            self.firewall._replace_owned_chain(spec)
 
     def test_rejects_invalid_interface_and_port(self):
         with self.assertRaises(ValueError):

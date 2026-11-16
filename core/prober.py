@@ -10,6 +10,8 @@ from collections import deque
 from .protocol import Packet, PacketType, PacketFlag, ProbeData
 
 class PathMetrics:
+    PROBE_TIMEOUT_SECONDS = 3.0
+
     def __init__(self, path_id: int, window_size: int = 30):
         self.path_id: int = path_id
         self.window_size: int = window_size
@@ -36,21 +38,15 @@ class PathMetrics:
             self.first_probe_sent_at = now
         self.sent_probes[probe_seq] = now
         self.total_probes_sent += 1
-        
-        # Clean up stale unacknowledged probes older than 3 seconds (mark as loss)
-        stale_cutoff = now - 3.0
-        stale_keys = [k for k, t in self.sent_probes.items() if t < stale_cutoff]
-        for k in stale_keys:
-            del self.sent_probes[k]
-            self.total_probes_lost += 1
-            self.probe_outcomes.append(False)
-            
+        self._expire_stale_probes(now)
         self._update_metrics()
         return ProbeData.encode(send_time=time.time(), probe_index=probe_seq)
 
     def record_probe_response(self, probe_data: bytes) -> float:
         now = time.monotonic()
         probe_seq = ProbeData.decode(probe_data)[1]
+        if self._expire_stale_probes(now):
+            self._update_metrics()
         
         if probe_seq in self.sent_probes:
             orig_send_time = self.sent_probes.pop(probe_seq)
@@ -61,6 +57,16 @@ class PathMetrics:
             self._update_metrics()
             return rtt
         return 0.0
+
+    def _expire_stale_probes(self, now: float) -> int:
+        stale_cutoff = now - self.PROBE_TIMEOUT_SECONDS
+        stale_keys = [seq for seq, sent_at in self.sent_probes.items()
+                      if sent_at < stale_cutoff]
+        for seq in stale_keys:
+            del self.sent_probes[seq]
+            self.total_probes_lost += 1
+            self.probe_outcomes.append(False)
+        return len(stale_keys)
 
     def _update_loss_rate(self):
         if self.probe_outcomes:

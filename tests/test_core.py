@@ -392,6 +392,17 @@ class TestMySpeedifyCore(unittest.TestCase):
         self.assertEqual(metrics.last_alive, 0.0)
         self.assertEqual(metrics.loss_rate, 1.0)
 
+    def test_expired_probe_response_is_counted_as_loss_without_new_probe(self):
+        metrics = LinkProber().get_path_metrics(1)
+        with patch("core.prober.time.monotonic", side_effect=[100.0, 103.1]):
+            probe = metrics.record_probe_sent(1)
+            self.assertEqual(metrics.record_probe_response(probe), 0.0)
+
+        self.assertEqual(metrics.last_alive, 0.0)
+        self.assertEqual(metrics.total_probes_lost, 1)
+        self.assertEqual(metrics.loss_rate, 1.0)
+        self.assertEqual(metrics.sent_probes, {})
+
     def test_failover_uses_priority_tiers_and_excludes_disabled_paths(self):
         prober = LinkProber()
         scheduler = PacketScheduler(prober=prober, mode=BondingMode.FAILOVER)

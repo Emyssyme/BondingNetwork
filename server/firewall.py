@@ -8,8 +8,6 @@ import subprocess
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
-logger = logging.getLogger("MySpeedify.Firewall")
-
 OWNER_MARKER = "myspeedify-managed-v1"
 CLIENT_NETWORK = "10.8.0.0/24"
 BLOCKED_DESTINATIONS = (
@@ -60,8 +58,14 @@ class LinuxFirewall:
                 change = self._replace_owned_chain(spec)
                 changes.append(change)
                 self._ensure_jump(spec, change)
-        except Exception:
-            self._rollback(changes)
+        except Exception as install_error:
+            try:
+                self._rollback(changes)
+            except Exception as rollback_error:
+                raise RuntimeError(
+                    f"Firewall installation failed ({install_error}); "
+                    f"rollback failed ({rollback_error})"
+                ) from install_error
             raise
 
     def remove(self) -> None:
@@ -170,8 +174,14 @@ class LinuxFirewall:
                 spec.tool, spec.table, "-A", spec.chain,
                 "-m", "comment", "--comment", OWNER_MARKER, "-j", "RETURN",
             )
-        except Exception:
-            self._restore_chain(spec, created, original_rules)
+        except Exception as install_error:
+            try:
+                self._restore_chain(spec, created, original_rules)
+            except Exception as rollback_error:
+                raise RuntimeError(
+                    f"Could not restore firewall chain {spec.chain} after "
+                    f"installation failed: {rollback_error}"
+                ) from install_error
             raise
 
         return ChainChange(spec, created, original_rules)
@@ -184,6 +194,23 @@ class LinuxFirewall:
             return result
         if "No chain/target/match by that name" in result.stderr:
             return None
+        if "Incompatible with this kernel" in result.stderr:
+            table_result = self._run(spec.tool, spec.table, "-S", check=False)
+            if table_result.returncode:
+                raise RuntimeError(
+                    f"Could not inspect firewall table {spec.table}: "
+                    f"{table_result.stderr.strip()}"
+                )
+            chain_lines = [
+                line for line in table_result.stdout.splitlines()
+                if line == f"-N {spec.chain}"
+                or line.startswith(f"-A {spec.chain} ")
+            ]
+            if not chain_lines:
+                return None
+            return subprocess.CompletedProcess(
+                table_result.args, 0, "\n".join(chain_lines), table_result.stderr,
+            )
         raise RuntimeError(
             f"Could not inspect firewall chain {spec.chain}: "
             f"{result.stderr.strip()}"
@@ -211,6 +238,8 @@ class LinuxFirewall:
             return True
         if "Bad rule" in result.stderr or "matching rule exist" in result.stderr:
             return False
+        if f"Chain '{spec.chain}' does not exist" in result.stderr:
+            return False
         raise RuntimeError(
             f"Could not inspect firewall jump to {spec.chain}: "
             f"{result.stderr.strip()}"
@@ -219,17 +248,15 @@ class LinuxFirewall:
     def _restore_chain(
         self, spec: ChainSpec, created: bool, original_rules: List[str]
     ) -> None:
-        try:
-            self._run(spec.tool, spec.table, "-F", spec.chain)
-            if created:
-                self._run(spec.tool, spec.table, "-X", spec.chain)
-            else:
-                for line in original_rules:
-                    self._run(spec.tool, spec.table, *shlex.split(line))
-        except Exception:
-            logger.exception("Could not restore firewall chain %s", spec.chain)
+        self._run(spec.tool, spec.table, "-F", spec.chain)
+        if created:
+            self._run(spec.tool, spec.table, "-X", spec.chain)
+        else:
+            for line in original_rules:
+                self._run(spec.tool, spec.table, *shlex.split(line))
 
     def _rollback(self, changes: List[ChainChange]) -> None:
+        errors = []
         for change in reversed(changes):
             if change.jump_inserted:
                 try:
@@ -237,19 +264,22 @@ class LinuxFirewall:
                         change.spec.tool, change.spec.table, "-D",
                         change.spec.parent, "-j", change.spec.chain,
                     )
-                except Exception:
-                    logger.exception(
-                        "Could not remove firewall jump for %s", change.spec.chain,
-                    )
-            self._restore_chain(
-                change.spec, change.created, change.original_rules,
-            )
+                except Exception as e:
+                    errors.append(e)
+            try:
+                self._restore_chain(
+                    change.spec, change.created, change.original_rules,
+                )
+            except Exception as e:
+                errors.append(e)
+        if errors:
+            raise RuntimeError(f"Could not fully roll back firewall changes: {errors[0]}")
 
     def _run(
         self, tool: str, table: str, *args: str, check: bool = True
     ) -> subprocess.CompletedProcess:
         command = [tool, "-w", "-t", table, *args]
-        result = subprocess.run(command, capture_output=True, text=True)
+        result = subprocess.run(command, check=False, capture_output=True, text=True)
         if check and result.returncode:
             detail = result.stderr.strip() or result.stdout.strip()
             raise RuntimeError(f"{' '.join(command)} failed: {detail}")
@@ -269,6 +299,7 @@ class LinuxFirewall:
 def detect_wan_interface() -> str:
     result = subprocess.run(
         ["ip", "-4", "route", "get", "1.1.1.1"],
+        check=False,
         capture_output=True,
         text=True,
     )

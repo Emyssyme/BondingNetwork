@@ -12,6 +12,8 @@ APP_DIR="/opt/myspeedify"
 SECRET_DIR="/etc/myspeedify"
 SECRET_FILE="$SECRET_DIR/secret"
 SYSCTL_FILE="/etc/sysctl.d/90-myspeedify-ipv4-forward.conf"
+FIREWALL_UNIT="/etc/systemd/system/myspeedify-firewall.service"
+SERVER_UNIT="/etc/systemd/system/myspeedify-server.service"
 
 if [[ ! -f "$REPO_ROOT/relay.py" || ! -d "$REPO_ROOT/core" || ! -d "$REPO_ROOT/server" ]]; then
     echo "Run the installer from a complete MySpeedify checkout." >&2
@@ -19,6 +21,32 @@ if [[ ! -f "$REPO_ROOT/relay.py" || ! -d "$REPO_ROOT/core" || ! -d "$REPO_ROOT/s
 fi
 if [[ -L "$APP_DIR" || ( -e "$APP_DIR" && ! -d "$APP_DIR" ) ]]; then
     echo "Refusing to use a non-directory or symlinked app path: $APP_DIR" >&2
+    exit 1
+fi
+for managed_dir in "$APP_DIR/core" "$APP_DIR/server"; do
+    if [[ -L "$managed_dir" || ( -e "$managed_dir" && ! -d "$managed_dir" ) ]]; then
+        echo "Refusing to use a non-directory or symlinked app path: $managed_dir" >&2
+        exit 1
+    fi
+    if [[ -d "$managed_dir" ]]; then
+        if ! symlink_path="$(find "$managed_dir" -type l -print -quit)"; then
+            echo "Could not inspect managed app path: $managed_dir" >&2
+            exit 1
+        fi
+        if [[ -n "$symlink_path" ]]; then
+            echo "Refusing to use a symlink in managed app path: $symlink_path" >&2
+            exit 1
+        fi
+    fi
+done
+if [[ -L "$APP_DIR/relay.py" ||
+      ( -e "$APP_DIR/relay.py" && ! -f "$APP_DIR/relay.py" ) ]]; then
+    echo "Refusing to use a non-regular or symlinked app path: $APP_DIR/relay.py" >&2
+    exit 1
+fi
+if [[ -L "$APP_DIR/venv" ||
+      ( -e "$APP_DIR/venv" && ! -d "$APP_DIR/venv" ) ]]; then
+    echo "Refusing to use a non-directory or symlinked app path: $APP_DIR/venv" >&2
     exit 1
 fi
 if [[ -L "$SECRET_DIR" || ( -e "$SECRET_DIR" && ! -d "$SECRET_DIR" ) ]]; then
@@ -29,6 +57,25 @@ if [[ -L "$SYSCTL_FILE" ]]; then
     echo "Refusing to use a symlinked sysctl config: $SYSCTL_FILE" >&2
     exit 1
 fi
+if [[ -e "$SYSCTL_FILE" && ! -f "$SYSCTL_FILE" ]]; then
+    echo "Refusing to use a non-regular sysctl config: $SYSCTL_FILE" >&2
+    exit 1
+fi
+if [[ -e "$SYSCTL_FILE" ]] &&
+   ! grep -Fxq "net.ipv4.ip_forward=1" "$SYSCTL_FILE"; then
+    echo "Refusing to overwrite existing sysctl config: $SYSCTL_FILE" >&2
+    exit 1
+fi
+if [[ -L "$SECRET_FILE" || ( -e "$SECRET_FILE" && ! -f "$SECRET_FILE" ) ]]; then
+    echo "Refusing to use a non-regular or symlinked secret path: $SECRET_FILE" >&2
+    exit 1
+fi
+for unit_file in "$FIREWALL_UNIT" "$SERVER_UNIT"; do
+    if [[ -L "$unit_file" || ( -e "$unit_file" && ! -f "$unit_file" ) ]]; then
+        echo "Refusing to overwrite a non-regular or symlinked systemd unit: $unit_file" >&2
+        exit 1
+    fi
+done
 
 echo "Installing MySpeedify v2 relay dependencies..."
 apt-get update
@@ -51,10 +98,6 @@ if ! id -u myspeedify >/dev/null 2>&1; then
         --shell /usr/sbin/nologin --gid myspeedify myspeedify
 fi
 
-if [[ -L "$SECRET_FILE" || ( -e "$SECRET_FILE" && ! -f "$SECRET_FILE" ) ]]; then
-    echo "Refusing to use a non-regular or symlinked secret path: $SECRET_FILE" >&2
-    exit 1
-fi
 install -d -o root -g myspeedify -m 0750 "$SECRET_DIR"
 if [[ ! -s "$SECRET_FILE" ]]; then
     (umask 077; head -c 32 /dev/urandom | base64 > "$SECRET_FILE")
@@ -62,12 +105,7 @@ fi
 chown myspeedify:myspeedify "$SECRET_FILE"
 chmod 0600 "$SECRET_FILE"
 
-if [[ -e "$SYSCTL_FILE" ]]; then
-    if ! grep -Fxq "net.ipv4.ip_forward=1" "$SYSCTL_FILE"; then
-        echo "Refusing to overwrite existing sysctl config: $SYSCTL_FILE" >&2
-        exit 1
-    fi
-else
+if [[ ! -e "$SYSCTL_FILE" ]]; then
     printf '%s\n' "net.ipv4.ip_forward=1" > "$SYSCTL_FILE"
     chmod 0644 "$SYSCTL_FILE"
 fi
@@ -77,13 +115,7 @@ python3 -m venv "$APP_DIR/venv"
 "$APP_DIR/venv/bin/pip" install --upgrade pip
 "$APP_DIR/venv/bin/pip" install --require-hashes -r "$APP_DIR/server/requirements.lock.txt"
 
-if [[ -L /etc/systemd/system/myspeedify-firewall.service ||
-      -L /etc/systemd/system/myspeedify-server.service ]]; then
-    echo "Refusing to overwrite symlinked MySpeedify systemd unit files." >&2
-    exit 1
-fi
-
-cat > /etc/systemd/system/myspeedify-firewall.service <<EOF
+cat > "$FIREWALL_UNIT" <<EOF
 [Unit]
 Description=MySpeedify scoped Linux firewall policy
 Wants=network-online.target
@@ -98,7 +130,7 @@ RemainAfterExit=yes
 WantedBy=multi-user.target
 EOF
 
-cat > /etc/systemd/system/myspeedify-server.service <<EOF
+cat > "$SERVER_UNIT" <<EOF
 [Unit]
 Description=MySpeedify v2 Channel Bonding Relay
 Requires=myspeedify-firewall.service
