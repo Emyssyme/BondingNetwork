@@ -6,8 +6,8 @@
 
 ## 🌟 Key Features
 
-- 🚀 **Dynamic Speed Bonding (Latency / Loss Weighted)**:
-  Selects paths using probe-derived quality weights.
+- 🚀 **Dynamic Speed Bonding (Capacity / Loss Weighted)**:
+  Selects paths using probe-derived relative capacity and quality weights.
 - 🛡️ **Streamer / Redundant Mode (Packet Duplication)**:
   Sends copies across active links to improve resilience; it does not guarantee zero packet loss.
 - 🔄 **Redundant Failover Mode**:
@@ -78,7 +78,7 @@ pip-compile --generate-hashes --output-file=server/requirements.lock.txt server/
 python main.py --server-host YOUR_VPS_IP --port 51820
 ```
 Configure `MYSPEEDIFY_SECRET_FILE` to point to a protected file containing
-the relay's shared legacy secret or this client's unique secret. For
+the relay's shared secret or this client's unique secret. For
 per-client authentication, also set `MYSPEEDIFY_CLIENT_ID` to the ID
 provisioned on the relay. The client prints a one-time
 dashboard URL bound to localhost. Windows requires the bundled, hash-verified
@@ -97,9 +97,11 @@ protected JSON file named by `MYSPEEDIFY_CLIENT_SECRETS_FILE`:
 }
 ```
 
-Use IDs of 1-64 letters, digits, `.`, `_` or `-`. Each value must be at least
-16 characters; generate a different, high-entropy secret for every client and
-deliver it through a secure channel. Keep the registry and each client's
+Use IDs of 1-64 letters, digits, `.`, `_` or `-`. Each secret must be a
+canonical 43-character URL-safe base64 value encoding 32 random bytes. Generate
+one with `python -c "import secrets; print(secrets.token_urlsafe(32))"` and
+deliver it through a secure channel. Passphrases and shorter keys are rejected.
+Keep the registry and each client's
 `MYSPEEDIFY_SECRET_FILE` restricted to the relay service account / client user
 (mode `0600` on POSIX). On systemd, configure the relay path with a service
 override, for example:
@@ -110,16 +112,16 @@ Environment=MYSPEEDIFY_CLIENT_SECRETS_FILE=/etc/myspeedify/clients.json
 ```
 
 Set `MYSPEEDIFY_CLIENT_ID=laptop-01` on that client's environment. During
-migration, the relay can continue accepting the old shared secret through
-`MYSPEEDIFY_SECRET_FILE`; clients without `MYSPEEDIFY_CLIENT_ID` use that
-legacy handshake. After all clients have unique IDs and secrets, remove the
+migration, the relay can continue accepting a shared 256-bit key through
+`MYSPEEDIFY_SECRET_FILE`; clients without `MYSPEEDIFY_CLIENT_ID` use the
+shared-key v2 handshake. After all clients have unique IDs and secrets, remove the
 shared-secret setting and restart the relay. With the Linux installer, set
 `Environment=MYSPEEDIFY_SECRET_FILE=` in the systemd override to disable its
-legacy secret file; keep `MYSPEEDIFY_CLIENT_SECRETS_FILE` set. Restarting
+shared-key setting; keep `MYSPEEDIFY_CLIENT_SECRETS_FILE` set. Restarting
 disconnects active sessions. To revoke a client, remove its ID from the
 registry and restart the relay; to rotate one client's key, update the
-registry and that client's secret file, then restart. The legacy v1
-client/relay path still uses the shared secret and must be migrated separately.
+registry and that client's secret file, then restart. The former v1 client and
+relay implementations have been removed; use the current v2 client and relay.
 
 ### Optional flow pinning
 
@@ -136,6 +138,10 @@ Malformed, fragmented, or unsupported packets use the existing
 weighted scheduler; Failover, Redundant, and urgent-packet behavior is
 unchanged.
 
+Speed-mode capacity is estimated from trains of four padded probes and smoothed
+across recent estimates. This is a relative burst-capacity signal, not a
+throughput guarantee; validate performance on the target network.
+
 ---
 
 ## ☁️ Deploying on a Cloud Relay Server (Linux VPS)
@@ -151,7 +157,10 @@ sudo ./setup_linux.sh
 ```
    The installer creates a persistent relay secret at `/etc/myspeedify/secret`
    and configures the relay to read it without placing it in the service command
-   line. Transfer that secret to clients using a secure channel. It also creates
+   line. New secrets are generated as random 256-bit URL-safe keys. If an
+   existing secret uses a non-canonical or legacy format, the installer refuses
+   to start the updated relay; rotate it and securely update all clients. Transfer
+   the secret to clients using a secure channel. It also creates
    dedicated, MySpeedify-owned firewall chains; it does not save or replace the
    host's global iptables rules. The relay runs as the `myspeedify` system user
    with `CAP_NET_ADMIN` for TUN configuration. IPv4 forwarding is enabled;

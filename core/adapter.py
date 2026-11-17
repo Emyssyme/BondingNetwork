@@ -39,6 +39,7 @@ class NetworkAdapter:
         self.latency_ms: float = 0.0
         self.jitter_ms: float = 0.0
         self.loss_pct: float = 0.0
+        self.estimated_capacity_bps: float = 0.0
         self.status: str = "Active"  # "Active", "Degraded", "Disconnected", "Testing"
         
         # Live Throughput Tracking
@@ -107,6 +108,7 @@ class NetworkAdapter:
             "latency_ms": round(self.latency_ms, 1),
             "jitter_ms": round(self.jitter_ms, 1),
             "loss_pct": round(self.loss_pct, 1),
+            "estimated_capacity_mbps": round(self.estimated_capacity_bps / 1_000_000.0, 2),
             "status": self.status,
             "upload_speed_mbps": round(self.upload_speed_bps / 1_000_000.0, 2),
             "download_speed_mbps": round(self.download_speed_bps / 1_000_000.0, 2),
@@ -122,33 +124,43 @@ def get_windows_adapter_descriptions() -> Dict[str, str]:
         return descs
     try:
         import winreg
-        key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r'SYSTEM\CurrentControlSet\Control\Network\{4D36E972-E325-11CE-BFC1-08002BE10318}')
-        class_key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r'SYSTEM\CurrentControlSet\Control\Class\{4d36e972-e325-11ce-bfc1-08002be10318}')
-        i = 0
-        while True:
-            try:
-                guid = winreg.EnumKey(key, i)
+        with winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE,
+            r'SYSTEM\CurrentControlSet\Control\Network\{4D36E972-E325-11CE-BFC1-08002BE10318}',
+        ) as key, winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE,
+            r'SYSTEM\CurrentControlSet\Control\Class\{4d36e972-e325-11ce-bfc1-08002be10318}',
+        ) as class_key:
+            i = 0
+            while True:
+                try:
+                    guid = winreg.EnumKey(key, i)
+                except OSError:
+                    break
                 i += 1
                 try:
-                    conn_key = winreg.OpenKey(key, rf'{guid}\Connection')
-                    name, _ = winreg.QueryValueEx(conn_key, 'Name')
-                    j = 0
-                    desc = ''
-                    while True:
-                        try:
-                            sub = winreg.EnumKey(class_key, j)
-                            j += 1
-                            sk = winreg.OpenKey(class_key, sub)
-                            try:
-                                inst_id, _ = winreg.QueryValueEx(sk, 'NetCfgInstanceId')
-                                if inst_id.lower() == guid.lower():
-                                    desc, _ = winreg.QueryValueEx(sk, 'DriverDesc')
-                                    break
-                            except FileNotFoundError: pass
-                        except OSError: break
-                    descs[name] = desc
-                except (FileNotFoundError, OSError): pass
-            except OSError: break
+                    with winreg.OpenKey(key, rf'{guid}\Connection') as conn_key:
+                        name, _ = winreg.QueryValueEx(conn_key, 'Name')
+                except (FileNotFoundError, OSError):
+                    continue
+
+                j = 0
+                desc = ''
+                while True:
+                    try:
+                        sub = winreg.EnumKey(class_key, j)
+                    except OSError:
+                        break
+                    j += 1
+                    try:
+                        with winreg.OpenKey(class_key, sub) as sk:
+                            inst_id, _ = winreg.QueryValueEx(sk, 'NetCfgInstanceId')
+                            if inst_id.lower() == guid.lower():
+                                desc, _ = winreg.QueryValueEx(sk, 'DriverDesc')
+                                break
+                    except (FileNotFoundError, OSError):
+                        continue
+                descs[name] = desc
     except Exception:
         pass
     return descs
@@ -215,14 +227,37 @@ def get_windows_interface_indices() -> Dict[str, int]:
 class AdapterManager:
     def __init__(self):
         self.adapters: Dict[str, NetworkAdapter] = {}
+        self._windows_lookup_signature = None
+        self._windows_lookup_time = 0.0
+        self._windows_descriptions: Dict[str, str] = {}
+        self._windows_indices: Dict[str, int] = {}
         self.refresh_adapters()
 
     def refresh_adapters(self) -> List[NetworkAdapter]:
         """Scans the operating system for usable IPv4 network interfaces"""
         net_if_addrs = psutil.net_if_addrs()
         net_if_stats = psutil.net_if_stats()
-        win_descs = get_windows_adapter_descriptions()
-        win_indices = get_windows_interface_indices()
+        signature = frozenset(
+            (
+                name,
+                address.address,
+                bool(getattr(net_if_stats.get(name), "isup", False)),
+            )
+            for name, addresses in net_if_addrs.items()
+            for address in addresses
+            if address.family == socket.AF_INET
+        )
+        now = time.monotonic()
+        if (
+            signature != self._windows_lookup_signature
+            or now - self._windows_lookup_time >= 60.0
+        ):
+            self._windows_descriptions = get_windows_adapter_descriptions()
+            self._windows_indices = get_windows_interface_indices()
+            self._windows_lookup_signature = signature
+            self._windows_lookup_time = now
+        win_descs = self._windows_descriptions
+        win_indices = self._windows_indices
         
         ignored_keywords = [
             'loopback', 'wsl', 'veth', 'docker', 'hyper-v', 

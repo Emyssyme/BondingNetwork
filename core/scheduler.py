@@ -197,6 +197,7 @@ class PacketScheduler:
             return [(best_path_id, pkt)]
 
         # Speed Mode (Dynamic Weighted Deficit Round-Robin)
+        active_adapters = self._healthy_adapters(active_adapters)
         flow_key = _extract_flow_key(payload) if self.flow_pinning else None
         if flow_key is None:
             chosen_path_id = self._select_weighted_path(active_adapters, len(payload))
@@ -213,6 +214,28 @@ class PacketScheduler:
             payload=payload
         )
         return [(chosen_path_id, pkt)]
+
+    def _healthy_adapters(
+        self, active_adapters: List[Tuple[int, NetworkAdapter]]
+    ) -> List[Tuple[int, NetworkAdapter]]:
+        now = time.monotonic()
+        healthy = []
+        for path_id, adapter in active_adapters:
+            metrics = self.prober.get_path_metrics(path_id)
+            never_probed = not metrics.first_probe_sent_at and metrics.last_alive == 0.0
+            probing_within_grace = (
+                metrics.first_probe_sent_at
+                and metrics.last_alive == 0.0
+                and now - metrics.first_probe_sent_at <= self.FAILOVER_PROBE_TIMEOUT_SECONDS
+            )
+            recently_alive = (
+                metrics.last_alive > 0.0
+                and now - metrics.last_alive <= self.FAILOVER_PROBE_TIMEOUT_SECONDS
+                and metrics.loss_rate < self.FAILOVER_MAX_LOSS_RATE
+            )
+            if never_probed or probing_within_grace or recently_alive:
+                healthy.append((path_id, adapter))
+        return healthy or active_adapters
 
     def _select_flow_pinned_path(
         self,
@@ -325,13 +348,27 @@ class PacketScheduler:
         if len(active_adapters) == 1:
             return active_adapters[0][0]
 
-        # Update weights from prober & adapter user weight
+        metrics_by_path = {
+            path_id: self.prober.get_path_metrics(path_id)
+            for path_id, _ in active_adapters
+        }
+        measured_capacities = [
+            metrics.capacity_bps
+            for metrics in metrics_by_path.values()
+            if metrics.capacity_bps is not None and metrics.capacity_bps > 0.0
+        ]
+        reference_capacity = max(measured_capacities, default=None)
+
         total_weight = 0.0
         weights = {}
         for path_id, adapter in active_adapters:
-            m = self.prober.get_path_metrics(path_id)
-            # adapter.weight is the manual factor; m.weight already includes live quality and loss.
-            w = max(0.1, adapter.weight) * m.weight
+            metrics = metrics_by_path[path_id]
+            capacity_weight = 1.0
+            if reference_capacity is not None and metrics.capacity_bps is not None:
+                capacity_weight = max(
+                    0.01, min(1.0, metrics.capacity_bps / reference_capacity),
+                )
+            w = max(0.1, adapter.weight) * metrics.weight * capacity_weight
             weights[path_id] = w
             total_weight += w
 

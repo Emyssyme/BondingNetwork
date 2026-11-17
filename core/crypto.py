@@ -1,59 +1,59 @@
 """
 Cryptography & Tunnel Security Engine
-Uses ChaCha20-Poly1305 AEAD (RFC 8439) for ultra-low-overhead authenticated encryption.
+
+ChaCha20-Poly1305 AEAD with:
+  * per-session, per-direction keys (derived in core/handshake.py from a random 256-bit PSK)
+  * nonce = direction(1) | path_id(1) | packet_type(1) | 0(1) | seq(8)  -> unique per key
+  * the 20-byte packet header is authenticated as AAD (session_id, type, flags, path, seq)
 """
 
-import os
+import base64
+import binascii
+import re
 import struct
-from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305, AESGCM
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+
+DIR_C2S = 0
+DIR_S2C = 1
+_NONCE_FMT = "!BBBBQ"  # 12 bytes
+_SECRET_PATTERN = re.compile(r"[A-Za-z0-9_-]{43}\Z")
+
+
+def derive_psk(secret: str) -> bytes:
+    """Decode a 256-bit URL-safe base64 secret; passphrases are not accepted."""
+    if not isinstance(secret, str) or not _SECRET_PATTERN.fullmatch(secret):
+        raise ValueError(
+            "Secret must be a 32-byte URL-safe base64 value; generate one with "
+            "secrets.token_urlsafe(32)"
+        )
+    try:
+        key = base64.urlsafe_b64decode(secret + "=")
+    except (ValueError, binascii.Error) as exc:
+        raise ValueError("Secret is not valid URL-safe base64") from exc
+    if (
+        len(key) != 32
+        or base64.urlsafe_b64encode(key).decode("ascii").rstrip("=") != secret
+    ):
+        raise ValueError("Secret must encode exactly 32 bytes")
+    return key
+
 
 class TunnelCrypto:
-    def __init__(self, key: bytes = None, use_aes: bool = False):
-        """
-        Initializes tunnel encryption engine.
-        Key must be 32 bytes (256 bits). If None, generates a random key.
-        """
-        if key is None:
-            self.key = os.urandom(32)
-        else:
-            if len(key) != 32:
-                raise ValueError("Key must be exactly 32 bytes (256 bits)")
-            self.key = key
-            
-        self.use_aes = use_aes
-        if self.use_aes:
-            self.cipher = AESGCM(self.key)
-        else:
-            self.cipher = ChaCha20Poly1305(self.key)
+    def __init__(self, send_key: bytes, recv_key: bytes, send_dir: int, recv_dir: int):
+        if len(send_key) != 32 or len(recv_key) != 32:
+            raise ValueError("Keys must be exactly 32 bytes")
+        self._send = ChaCha20Poly1305(send_key)
+        self._recv = ChaCha20Poly1305(recv_key)
+        self._send_dir = send_dir
+        self._recv_dir = recv_dir
 
-    @classmethod
-    def from_passphrase(cls, passphrase: str, salt: bytes = b'myspeedify_bonding_salt') -> 'TunnelCrypto':
-        """Derives a 256-bit key from a user passphrase using HKDF-SHA256"""
-        hkdf = HKDF(
-            algorithm=hashes.SHA256(),
-            length=32,
-            salt=salt,
-            info=b'myspeedify-tunnel-v1',
-        )
-        key = hkdf.derive(passphrase.encode('utf-8'))
-        return cls(key=key)
+    @staticmethod
+    def _nonce(direction: int, path_id: int, ptype: int, seq: int) -> bytes:
+        return struct.pack(_NONCE_FMT, direction, path_id & 0xFF, ptype & 0xFF, 0, seq)
 
-    def _make_nonce(self, seq_num: int, path_id: int) -> bytes:
-        """
-        Constructs a unique 12-byte (96-bit) nonce using sequence number and path ID.
-        Prevents nonce reuse.
-        """
-        # 8 bytes sequence number + 1 byte path_id + 3 bytes zero padding
-        return struct.pack("!QBB2s", seq_num, path_id, 0, b'\x00\x00')
+    def encrypt(self, plaintext: bytes, seq: int, path_id: int, ptype: int, aad: bytes) -> bytes:
+        return self._send.encrypt(self._nonce(self._send_dir, path_id, ptype, seq), plaintext, aad)
 
-    def encrypt(self, plaintext: bytes, seq_num: int, path_id: int, associated_data: bytes = b'') -> bytes:
-        """Encrypts plaintext with authenticated associated data (AAD)"""
-        nonce = self._make_nonce(seq_num, path_id)
-        return self.cipher.encrypt(nonce, plaintext, associated_data)
-
-    def decrypt(self, ciphertext: bytes, seq_num: int, path_id: int, associated_data: bytes = b'') -> bytes:
-        """Decrypts and authenticates ciphertext. Raises InvalidTag if tampering occurred."""
-        nonce = self._make_nonce(seq_num, path_id)
-        return self.cipher.decrypt(nonce, ciphertext, associated_data)
+    def decrypt(self, ciphertext: bytes, seq: int, path_id: int, ptype: int, aad: bytes) -> bytes:
+        """Raises cryptography.exceptions.InvalidTag on tampering / wrong key."""
+        return self._recv.decrypt(self._nonce(self._recv_dir, path_id, ptype, seq), ciphertext, aad)

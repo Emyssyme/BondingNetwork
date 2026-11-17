@@ -1,11 +1,38 @@
 import argparse
+import logging
+import logging.handlers
+import os
 from pathlib import Path
+import sys
 
 import uvicorn
 
 import api
 from core.secret import load_secret
 from daemon import ClientDaemon
+
+
+def _configure_logging() -> None:
+    log_dir = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "MySpeedify"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    level_name = os.environ.get("MYSPEEDIFY_LOG_LEVEL", "INFO").upper()
+    level = logging.getLevelName(level_name)
+    if not isinstance(level, int):
+        raise ValueError(f"Invalid MYSPEEDIFY_LOG_LEVEL: {level_name}")
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        handlers=[
+            logging.StreamHandler(),
+            logging.handlers.RotatingFileHandler(
+                log_dir / "client.log",
+                maxBytes=2_000_000,
+                backupCount=3,
+                encoding="utf-8",
+            ),
+        ],
+        force=True,
+    )
 
 
 def _port(value: str) -> int:
@@ -19,6 +46,7 @@ def _port(value: str) -> int:
 
 
 def main() -> None:
+    _configure_logging()
     parser = argparse.ArgumentParser(description="Run the MySpeedify client and local dashboard.")
     parser.add_argument("--server-host", default="127.0.0.1", help="Relay hostname or IPv4 address")
     parser.add_argument("--port", type=_port, default=51820, help="Relay UDP port")
@@ -39,6 +67,8 @@ def main() -> None:
             flush=True,
         )
         uvicorn.run(api.app, host="127.0.0.1", port=args.dashboard_port)
+        if daemon.fatal_error:
+            raise SystemExit(1)
     finally:
         daemon.stop()
 

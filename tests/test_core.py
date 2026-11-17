@@ -5,13 +5,13 @@ Unit & Integration Tests for MySpeedify Core Engine
 import unittest
 import socket
 import struct
+from types import SimpleNamespace
 from unittest.mock import patch
-from core.protocol import Packet, PacketType, PacketFlag
-from core.crypto import TunnelCrypto
+from core.protocol import Packet, PacketType, PacketFlag, ProbeData
 from core.reorder import ReorderBuffer
 from core.replay import ReplayWindow
 from core.scheduler import PacketScheduler, BondingMode
-from core.adapter import NetworkAdapter
+from core.adapter import AdapterManager, NetworkAdapter
 from core.prober import LinkProber
 
 
@@ -108,19 +108,6 @@ class TestMySpeedifyCore(unittest.TestCase):
         self.assertEqual(deserialized.seq_num, 987654321)
         self.assertEqual(deserialized.payload, original_payload)
 
-    def test_crypto_aead(self):
-        """Tests ChaCha20-Poly1305 encryption and authentication"""
-        crypto = TunnelCrypto.from_passphrase("test_password_123")
-        plaintext = b"Super secret channel bonding IP packet payload"
-        seq_num = 42
-        path_id = 1
-        
-        ciphertext = crypto.encrypt(plaintext, seq_num=seq_num, path_id=path_id)
-        self.assertNotEqual(ciphertext, plaintext)
-        
-        decrypted = crypto.decrypt(ciphertext, seq_num=seq_num, path_id=path_id)
-        self.assertEqual(decrypted, plaintext)
-
     def test_reorder_buffer_out_of_order(self):
         """Tests reassembly when packets arrive out of order (e.g. 0, 2, 1, 3)"""
         reorder = ReorderBuffer(max_hold_time_ms=50.0)
@@ -154,15 +141,59 @@ class TestMySpeedifyCore(unittest.TestCase):
         self.assertEqual(reorder.stats()["duplicates_dropped"], 1)
         self.assertEqual(reorder.stats()["expected_seq"], 43)
 
+    def test_reorder_buffer_preserves_first_expected_packet(self):
+        reorder = ReorderBuffer(max_hold_time_ms=50.0)
+        reorder.reset(initial_seq=1)
+
+        with patch("core.reorder.time.monotonic", return_value=100.0):
+            self.assertEqual(reorder.push(2, b"second"), [])
+            self.assertEqual(reorder.push(1, b"first"), [b"first", b"second"])
+
+    def test_windows_adapter_metadata_is_cached_until_signature_changes_or_expires(self):
+        addresses = {
+            "Ethernet": [
+                SimpleNamespace(family=socket.AF_INET, address="192.0.2.10"),
+            ],
+        }
+        now = [100.0]
+        with patch("core.adapter.platform.system", return_value="Windows"), \
+                patch("core.adapter.psutil.net_if_addrs", side_effect=lambda: addresses), \
+                patch(
+                    "core.adapter.psutil.net_if_stats",
+                    return_value={"Ethernet": SimpleNamespace(isup=True)},
+                ), patch(
+                    "core.adapter.get_windows_adapter_descriptions",
+                    return_value={"Ethernet": "Ethernet adapter"},
+                ) as descriptions, patch(
+                    "core.adapter.get_windows_interface_indices",
+                    return_value={"Ethernet": 7},
+                ) as indices, patch(
+                    "core.adapter.time.monotonic", side_effect=lambda: now[0],
+                ):
+            manager = AdapterManager()
+            manager.refresh_adapters()
+            self.assertEqual(descriptions.call_count, 1)
+            self.assertEqual(indices.call_count, 1)
+
+            addresses["Ethernet"][0].address = "192.0.2.11"
+            manager.refresh_adapters()
+            self.assertEqual(descriptions.call_count, 2)
+            self.assertEqual(indices.call_count, 2)
+
+            now[0] = 161.0
+            manager.refresh_adapters()
+            self.assertEqual(descriptions.call_count, 3)
+            self.assertEqual(indices.call_count, 3)
+
     def test_reorder_buffer_reports_next_expiry_deadline(self):
         reorder = ReorderBuffer(max_hold_time_ms=30.0)
         reorder.reset(initial_seq=0)
 
-        with patch("core.reorder.time.time", return_value=100.0):
+        with patch("core.reorder.time.monotonic", return_value=100.0):
             self.assertEqual(reorder.push(1, b"held"), [])
-        with patch("core.reorder.time.time", return_value=100.012):
+        with patch("core.reorder.time.monotonic", return_value=100.012):
             self.assertAlmostEqual(reorder.time_until_expiry(), 0.018)
-        with patch("core.reorder.time.time", return_value=100.04):
+        with patch("core.reorder.time.monotonic", return_value=100.04):
             self.assertEqual(reorder.time_until_expiry(), 0.0)
 
     def test_reorder_buffer_duplicate_suppression(self):
@@ -205,15 +236,15 @@ class TestMySpeedifyCore(unittest.TestCase):
         self.assertEqual(len(scheduled_failover), 1)
         self.assertTrue(scheduled_failover[0][1].flags & PacketFlag.FAILOVER)
 
-    def test_speed_weight_combines_manual_and_dynamic_factors_by_bytes(self):
+    def test_speed_weight_combines_manual_and_capacity_factors_by_bytes(self):
         prober = LinkProber()
         scheduler = PacketScheduler(prober=prober, mode=BondingMode.SPEED)
         primary = NetworkAdapter("Primary", "192.0.2.1")
         secondary = NetworkAdapter("Secondary", "192.0.2.2")
         primary.weight = 2.0
         secondary.weight = 1.0
-        prober.get_path_metrics(1).weight = 2.0
-        prober.get_path_metrics(2).weight = 1.0
+        prober.get_path_metrics(1).capacity_bps = 2_000_000.0
+        prober.get_path_metrics(2).capacity_bps = 1_000_000.0
 
         sent_bytes = {1: 0, 2: 0}
         active = [(1, primary), (2, secondary)]
@@ -226,6 +257,28 @@ class TestMySpeedifyCore(unittest.TestCase):
 
         self.assertGreater(sent_bytes[1], sent_bytes[2] * 3)
         self.assertLess(sent_bytes[1], sent_bytes[2] * 5)
+
+    def test_speed_mode_excludes_stale_paths_when_a_healthy_path_exists(self):
+        prober = LinkProber()
+        scheduler = PacketScheduler(prober, mode=BondingMode.SPEED)
+        adapters = [
+            (1, NetworkAdapter("Stale", "192.0.2.1")),
+            (2, NetworkAdapter("Healthy", "192.0.2.2")),
+        ]
+        stale = prober.get_path_metrics(1)
+        stale.first_probe_sent_at = 90.0
+        stale.last_alive = 90.0
+        healthy = prober.get_path_metrics(2)
+        healthy.first_probe_sent_at = 90.0
+        healthy.last_alive = 100.0
+
+        with patch("core.scheduler.time.monotonic", return_value=100.0):
+            selected = [
+                scheduler.schedule(b"packet", seq, 7, adapters)[0][0]
+                for seq in range(1, 21)
+            ]
+
+        self.assertEqual(set(selected), {2})
 
     def test_flow_pinning_keeps_reverse_packets_on_eligible_path(self):
         prober = LinkProber()
@@ -320,7 +373,10 @@ class TestMySpeedifyCore(unittest.TestCase):
 
         with patch(
             "core.scheduler.time.monotonic",
-            side_effect=[100.0, 101.0, 102.0, 103.0, 104.0],
+            side_effect=[
+                100.0, 100.0, 101.0, 101.0, 102.0,
+                102.0, 103.0, 103.0, 104.0, 104.0,
+            ],
         ):
             scheduler.schedule(flows[0], 1, 7, [path_one])
             scheduler.schedule(flows[1], 2, 7, [path_one])
@@ -381,6 +437,29 @@ class TestMySpeedifyCore(unittest.TestCase):
             prober.generate_probes([], session_id=1)
             self.assertFalse(prober.should_probe())
             self.assertTrue(prober.should_probe())
+
+    def test_capacity_probe_train_estimates_goodput_without_using_rtt_as_weight(self):
+        prober = LinkProber()
+        with patch("core.prober.time.monotonic", return_value=100.0):
+            probes = prober.generate_probes([1], session_id=1)
+
+        self.assertEqual(len(probes), LinkProber.CAPACITY_TRAIN_SIZE)
+        self.assertTrue(all(
+            len(packet.payload) == ProbeData.SIZE + LinkProber.CAPACITY_PROBE_PADDING
+            for _, packet in probes
+        ))
+
+        metrics = prober.get_path_metrics(1)
+        for (_, packet), response_time in zip(
+            probes, (100.01, 100.02, 100.03, 100.04),
+        ):
+            with patch("core.prober.time.monotonic", return_value=response_time):
+                metrics.record_probe_response(packet.payload)
+
+        expected = (
+            (LinkProber.CAPACITY_PROBE_PADDING + ProbeData.SIZE) * 3 * 8 / 0.03
+        )
+        self.assertAlmostEqual(metrics.capacity_bps, expected)
 
     def test_late_probe_response_does_not_mark_path_alive(self):
         metrics = LinkProber().get_path_metrics(1)

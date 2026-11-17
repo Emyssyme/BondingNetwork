@@ -145,23 +145,138 @@ class TestTunnelNetworkConfig(unittest.TestCase):
         new_route_add = commands.index((
             "ip", "-4", "route", "add", "198.51.100.11/32",
             "via", "192.0.2.1", "dev", "eth0", "onlink",
-            "table", "24001",
+            "table", "24001", "proto", "99",
         ))
         old_rule_delete = commands.index((
             "ip", "-4", "rule", "del", "priority", "10000",
             "from", "192.0.2.10/32", "to", "198.51.100.10/32",
-            "table", "24000",
+            "table", "24000", "protocol", "99",
         ))
         self.assertLess(new_route_add, old_rule_delete)
         self.assertIn((
             "ip", "-4", "route", "add", "198.51.100.11/32",
             "via", "203.0.113.1", "dev", "eth1", "onlink",
-            "table", "24002",
+            "table", "24002", "proto", "99",
         ), commands)
         self.assertIn((
             "ip", "-4", "route", "del", "198.51.100.11/32",
             "via", "203.0.113.1", "dev", "eth1", "table", "24002",
+            "proto", "99",
         ), commands)
+
+    def test_linux_startup_cleans_only_myspeedify_owned_residues(self):
+        tun = Mock()
+        tun.name = "msp0"
+        path = PhysicalPath("eth0", "192.0.2.10", 2)
+        with patch("core.tun.routes.platform.system", return_value="Linux"):
+            config = TunnelNetworkConfig(tun, "198.51.100.10", [path])
+        commands = []
+
+        def run(*command):
+            commands.append(command)
+            if command == ("ip", "-4", "rule", "show"):
+                return subprocess.CompletedProcess(
+                    command,
+                    0,
+                    "10000: from 192.0.2.10 to 198.51.100.10 "
+                    "lookup 24000 proto 99\n"
+                    "10001: from all to 198.51.100.10 lookup 24001 proto 99\n"
+                    "40000: from 192.0.2.10 to 198.51.100.10 "
+                    "lookup 24000 proto 99\n"
+                    "200: from all lookup main\n",
+                    "",
+                )
+            if command == ("ip6tables", "-w", "-S", "OUTPUT"):
+                return subprocess.CompletedProcess(
+                    command,
+                    0,
+                    "-A OUTPUT -o msp0 -m comment --comment msp-123-1234abcd -j DROP\n"
+                    "-A OUTPUT -o eth1 -m comment --comment msp-foreign -j DROP\n"
+                    "-A OUTPUT -o eth0 -j ACCEPT\n",
+                    "",
+                )
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with patch.object(config, "_run", side_effect=run):
+            config._cleanup_stale()
+
+        self.assertIn(
+            (
+                "ip", "-4", "rule", "del", "priority", "10000",
+                "from", "192.0.2.10", "to", "198.51.100.10", "table", "24000",
+            ),
+            commands,
+        )
+        self.assertIn(
+            ("ip", "-4", "route", "flush", "table", "24000", "to", "198.51.100.10/32"),
+            commands,
+        )
+        self.assertNotIn(
+            (
+                "ip", "-4", "rule", "del", "priority", "10001",
+                "from", "all", "to", "198.51.100.10", "table", "24001",
+            ),
+            commands,
+        )
+        self.assertNotIn(
+            (
+                "ip", "-4", "rule", "del", "priority", "40000",
+                "from", "192.0.2.10", "to", "198.51.100.10", "table", "24000",
+            ),
+            commands,
+        )
+        self.assertIn(
+            ("ip6tables", "-w", "-D", "OUTPUT", "-o", "msp0", "-m", "comment",
+             "--comment", "msp-123-1234abcd", "-j", "DROP"),
+            commands,
+        )
+        self.assertNotIn(
+            (
+                "ip6tables", "-w", "-D", "OUTPUT", "-o", "eth1", "-m", "comment",
+                "--comment", "msp-foreign", "-j", "DROP",
+            ),
+            commands,
+        )
+        self.assertNotIn(
+            ("ip6tables", "-w", "-D", "OUTPUT", "-o", "eth0", "-j", "ACCEPT"),
+            commands,
+        )
+
+    def test_windows_startup_removes_owned_rules_and_routes_only_on_tun(self):
+        tun = Mock()
+        tun.adapter_name = "MySpeedifyVPN"
+        with patch("core.tun.routes.platform.system", return_value="Windows"):
+            config = TunnelNetworkConfig(tun, "198.51.100.10", [])
+        commands = []
+        scripts = []
+
+        def run(*command):
+            commands.append(command)
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        def powershell(script):
+            scripts.append(script)
+            if "Get-NetFirewallRule" in script:
+                return '["MySpeedify-IPv6-123-abcd","OtherFirewallRule"]'
+            return ""
+
+        with patch.object(config, "_run", side_effect=run), \
+                patch.object(config, "_powershell", side_effect=powershell), \
+                patch.object(config, "_interface_index", return_value=17):
+            config._cleanup_stale()
+
+        self.assertIn(
+            (
+                "netsh.exe", "advfirewall", "firewall", "delete", "rule",
+                "name=MySpeedify-IPv6-123-abcd",
+            ),
+            commands,
+        )
+        self.assertEqual(
+            sum("Remove-NetRoute" in script for script in scripts),
+            2,
+        )
+        self.assertTrue(all("-InterfaceIndex 17" in script for script in scripts if "Remove-NetRoute" in script))
 
     def test_windows_restores_dns_and_removes_kill_switch(self):
         tun = Mock()

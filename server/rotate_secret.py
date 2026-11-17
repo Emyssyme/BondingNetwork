@@ -1,6 +1,9 @@
 """Safely rotate the Linux relay secret and restart its systemd service."""
 
+import base64
+import binascii
 import os
+import re
 import secrets
 import stat
 import subprocess
@@ -12,6 +15,18 @@ from pathlib import Path
 SECRET_DIR = Path("/etc/myspeedify")
 SECRET_FILE = SECRET_DIR / "secret"
 SERVICE = "myspeedify-server.service"
+_SECRET_PATTERN = re.compile(r"[A-Za-z0-9_-]{43}\Z")
+
+
+def _validate_new_secret(secret: str) -> None:
+    if not isinstance(secret, str) or not _SECRET_PATTERN.fullmatch(secret):
+        raise ValueError("New secret must be a canonical 32-byte URL-safe base64 key")
+    try:
+        key = base64.urlsafe_b64decode(secret + "=")
+    except (ValueError, binascii.Error) as exc:
+        raise ValueError("New secret is not valid URL-safe base64") from exc
+    if len(key) != 32 or base64.urlsafe_b64encode(key).decode("ascii").rstrip("=") != secret:
+        raise ValueError("New secret must encode exactly 32 bytes")
 
 
 def _read_existing_secret(path: Path) -> tuple[bytes, os.stat_result]:
@@ -77,7 +92,9 @@ def rotate_secret_file(
     secret_factory: Callable[[], str] = lambda: secrets.token_urlsafe(32),
 ) -> None:
     previous_secret, previous_stat = _read_existing_secret(path)
-    new_secret = (secret_factory() + "\n").encode("utf-8")
+    new_secret_value = secret_factory()
+    _validate_new_secret(new_secret_value)
+    new_secret = (new_secret_value + "\n").encode("utf-8")
     _atomic_replace(path, new_secret, 0o600, owner)
 
     try:

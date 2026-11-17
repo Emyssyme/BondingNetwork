@@ -44,7 +44,7 @@ class ReorderBuffer:
         Pushes an incoming packet into the buffer.
         Returns a list of payloads ready for in-order delivery.
         """
-        now = time.time()
+        now = time.monotonic()
         
         if not self.initialized:
             self.expected_seq = seq_num
@@ -71,7 +71,7 @@ class ReorderBuffer:
         """Release packets whose missing predecessors have exceeded the hold time."""
         if not self.heap:
             return []
-        return self._drain(time.time())
+        return self._drain(time.monotonic())
 
     def time_until_expiry(self) -> Optional[float]:
         if not self.heap:
@@ -79,7 +79,7 @@ class ReorderBuffer:
         if len(self.heap) >= self.max_buffer_size:
             return 0.0
         arrival_time = self.heap[0][1]
-        return max(0.0, self.max_hold_time - (time.time() - arrival_time))
+        return max(0.0, self.max_hold_time - (time.monotonic() - arrival_time))
 
     def _drain(self, now: float, force_expired: bool = False) -> List[bytes]:
         ready: List[bytes] = []

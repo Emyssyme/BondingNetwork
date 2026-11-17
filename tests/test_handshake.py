@@ -5,10 +5,10 @@ from unittest import mock
 
 from cryptography.exceptions import InvalidTag
 
-from core.crypto_v2 import derive_psk
+from core.crypto import derive_psk
 from core.handshake import ClientHandshake, parse_init, parse_init_client_id, build_resp
 
-SECRET = "unit-test-secret-0123456789"
+SECRET = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"
 
 
 def _session(sid=4242, secret=SECRET):
@@ -56,7 +56,7 @@ class TestHandshake(unittest.TestCase):
 
     def test_wrong_secret_rejected(self):
         cl = ClientHandshake(derive_psk(SECRET), 1)
-        self.assertIsNone(parse_init(derive_psk("another-secret-0123456789"), 1, cl.build_init()))
+        self.assertIsNone(parse_init(derive_psk("ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8"), 1, cl.build_init()))
 
     def test_init_bound_to_session_id_and_stale_rejected(self):
         psk = derive_psk(SECRET)
@@ -74,7 +74,7 @@ class TestHandshake(unittest.TestCase):
         parsed = parse_init(psk, 1, init)
         if parsed is None:
             self.fail("Per-client INIT failed authentication")
-        self.assertIsNone(parse_init(derive_psk("different-client-secret"), 1, init))
+        self.assertIsNone(parse_init(derive_psk("YGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6e3x9fn8"), 1, init))
         tampered = b"\x05alixe" + init[6:]
         self.assertIsNone(parse_init(psk, 1, tampered))
         cpub, cnonce = parsed
@@ -100,6 +100,19 @@ class TestHandshake(unittest.TestCase):
     def test_short_secret_refused(self):
         with self.assertRaises(ValueError):
             derive_psk("short")
+
+    def test_secret_must_be_canonical_urlsafe_base64_for_32_bytes(self):
+        self.assertEqual(
+            derive_psk(SECRET),
+            bytes(range(32)),
+        )
+        for secret in (
+            SECRET + "=",
+            "weak-passphrase",
+            "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh9",
+        ):
+            with self.subTest(secret=secret), self.assertRaises(ValueError):
+                derive_psk(secret)
 
 
 if __name__ == "__main__":

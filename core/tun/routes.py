@@ -6,6 +6,7 @@ import logging
 import os
 import platform
 import re
+import shlex
 import socket
 import subprocess
 import threading
@@ -57,6 +58,7 @@ class TunnelNetworkConfig:
             try:
                 if not self._paths:
                     raise RuntimeError("Cannot enable full-tunnel routes without a physical path")
+                self._cleanup_stale()
                 if self.system == "Linux":
                     self._install_linux()
                 elif self.system == "Windows":
@@ -234,30 +236,32 @@ class TunnelNetworkConfig:
                 self._run(
                     "ip", "-4", "route", "add", f"{relay_ip}/32",
                     "via", gateway, "dev", path.interface_name, "onlink",
-                    "table", str(table),
+                    "table", str(table), "proto", "99",
                 )
                 actions.append(lambda: self._run(
                     "ip", "-4", "route", "del", f"{relay_ip}/32",
                     "via", gateway, "dev", path.interface_name, "table", str(table),
+                    "proto", "99",
                 ))
             else:
                 self._run(
                     "ip", "-4", "route", "add", f"{relay_ip}/32",
                     "dev", path.interface_name, "scope", "link", "table", str(table),
+                    "proto", "99",
                 )
                 actions.append(lambda: self._run(
                     "ip", "-4", "route", "del", f"{relay_ip}/32",
-                    "dev", path.interface_name, "table", str(table),
+                    "dev", path.interface_name, "table", str(table), "proto", "99",
                 ))
             self._run(
                 "ip", "-4", "rule", "add", "priority", str(priority),
                 "from", f"{path.local_ip}/32", "to", f"{relay_ip}/32",
-                "table", str(table),
+                "table", str(table), "protocol", "99",
             )
             actions.append(lambda: self._run(
                 "ip", "-4", "rule", "del", "priority", str(priority),
                 "from", f"{path.local_ip}/32", "to", f"{relay_ip}/32",
-                "table", str(table),
+                "table", str(table), "protocol", "99",
             ))
             return actions
         except Exception:
@@ -286,6 +290,113 @@ class TunnelNetworkConfig:
             "route.exe", "DELETE", relay_ip, "MASK", "255.255.255.255",
             gateway, "IF", str(index),
         )]
+
+    def _cleanup_stale(self) -> None:
+        if self.system == "Linux":
+            self._cleanup_linux_stale()
+        elif self.system == "Windows":
+            self._cleanup_windows_stale()
+
+    def _cleanup_linux_stale(self) -> None:
+        rules = self._run("ip", "-4", "rule", "show").stdout
+        path_addresses = {f"{path.local_ip}/32" for path in self._paths.values()}
+        relay_address = f"{self.relay_ip}/32"
+        for line in rules.splitlines():
+            priority = re.match(r"\s*(\d+):", line)
+            source = re.search(r"\bfrom\s+(\S+)", line)
+            destination = re.search(r"\bto\s+(\S+)", line)
+            table = re.search(r"\b(?:lookup|table)\s+(\d+)\b", line)
+            tagged = re.search(r"\b(?:protocol|proto)\s+99\b", line)
+            if not (priority and source and destination and table):
+                continue
+            priority_id = int(priority.group(1))
+            table_id = int(table.group(1))
+            managed_ids = (
+                10000 <= priority_id < 30000
+                and 20000 <= table_id < 30000
+            )
+            managed_prefixes = True
+            try:
+                networks = [
+                    ipaddress.ip_network(value, strict=False)
+                    for value in (source.group(1), destination.group(1))
+                ]
+                managed_prefixes = all(
+                    isinstance(network, ipaddress.IPv4Network)
+                    and network.prefixlen == 32
+                    for network in networks
+                )
+            except ValueError:
+                managed_prefixes = False
+            owns_rule = managed_ids and (
+                (bool(tagged) and managed_prefixes)
+                or (
+                    source.group(1) in path_addresses
+                    and destination.group(1) == relay_address
+                )
+            )
+            if not owns_rule:
+                continue
+            self._run(
+                "ip", "-4", "rule", "del", "priority", priority.group(1),
+                "from", source.group(1), "to", destination.group(1),
+                "table", str(table_id),
+            )
+            self._run(
+                "ip", "-4", "route", "flush", "table", str(table_id),
+                "to", f"{destination.group(1)}/32",
+            )
+
+        output = self._run("ip6tables", "-w", "-S", "OUTPUT").stdout
+        for line in output.splitlines():
+            try:
+                args = shlex.split(line)
+            except ValueError:
+                continue
+            if len(args) < 3 or args[0] != "-A" or args[1] != "OUTPUT":
+                continue
+            try:
+                comment_index = args.index("--comment")
+                comment = args[comment_index + 1]
+            except (ValueError, IndexError):
+                continue
+            if re.fullmatch(r"msp-\d+-[0-9a-f]{8}", comment):
+                self._run("ip6tables", "-w", "-D", "OUTPUT", *args[2:])
+
+    def _cleanup_windows_stale(self) -> None:
+        raw_rules = self._powershell(
+            "Get-NetFirewallRule -DisplayName 'MySpeedify-IPv6-*' "
+            "-ErrorAction SilentlyContinue | "
+            "Select-Object -ExpandProperty DisplayName | ConvertTo-Json -Compress"
+        )
+        if raw_rules:
+            rule_names = json.loads(raw_rules)
+            if isinstance(rule_names, str):
+                rule_names = [rule_names]
+            if not isinstance(rule_names, list):
+                raise RuntimeError(f"Unexpected MySpeedify firewall rule data: {rule_names!r}")
+            for name in rule_names:
+                if isinstance(name, str) and name.startswith("MySpeedify-IPv6-"):
+                    self._run(
+                        "netsh.exe", "advfirewall", "firewall", "delete", "rule",
+                        f"name={name}",
+                    )
+
+        tun_index = self._interface_index(self.tun.adapter_name)
+        for destination in ("0.0.0.0/1", "128.0.0.0/1"):
+            self._powershell(
+                f"Get-NetRoute -InterfaceIndex {tun_index} -AddressFamily IPv4 "
+                f"-DestinationPrefix '{destination}' -ErrorAction SilentlyContinue | "
+                "Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue"
+            )
+        for path in self._paths.values():
+            index = path.if_index or self._interface_index(path.interface_name)
+            self._powershell(
+                f"Get-NetRoute -InterfaceIndex {index} -AddressFamily IPv4 "
+                f"-DestinationPrefix '{self.relay_ip}/32' -ErrorAction SilentlyContinue | "
+                "Where-Object { $_.RouteMetric -eq 1 } | "
+                "Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue"
+            )
 
     def _allocate_linux_ids(self) -> Tuple[int, int]:
         rules = self._run("ip", "-4", "rule", "show").stdout

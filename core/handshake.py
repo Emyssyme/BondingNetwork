@@ -22,7 +22,7 @@ from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
-from .crypto_v2 import TunnelCrypto, DIR_C2S, DIR_S2C
+from .crypto import TunnelCrypto, DIR_C2S, DIR_S2C
 from .secret import is_valid_client_id
 
 _INIT = struct.Struct("!32s16sQ")

@@ -5,6 +5,8 @@ import os
 import re
 import stat
 
+from .crypto import derive_psk
+
 _CLIENT_ID_PATTERN = re.compile(r"[A-Za-z0-9._-]{1,64}\Z")
 
 
@@ -55,8 +57,12 @@ def _read_secret_file(path: str) -> str:
 def load_secret(secret_file: str | None = None) -> str | None:
     path = secret_file or os.environ.get("MYSPEEDIFY_SECRET_FILE")
     if path:
-        return _read_secret_file(path).strip() or None
-    return os.environ.get("MYSPEEDIFY_SECRET") or None
+        secret = _read_secret_file(path).strip() or None
+    else:
+        secret = os.environ.get("MYSPEEDIFY_SECRET") or None
+    if secret is not None:
+        derive_psk(secret)
+    return secret
 
 
 def _unique_client_entries(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -87,8 +93,9 @@ def load_client_secrets(secret_file: str | None = None) -> dict[str, str]:
     for client_id, secret in entries.items():
         if not isinstance(client_id, str) or not is_valid_client_id(client_id):
             raise ValueError("Client secrets file contains an invalid client ID")
-        if not isinstance(secret, str) or len(secret) < 16:
-            raise ValueError("Each client secret must contain at least 16 characters")
+        if not isinstance(secret, str):
+            raise ValueError("Each client secret must be a 32-byte URL-safe base64 value")
+        derive_psk(secret)
         if secret in seen_secrets:
             raise ValueError("Each client must have a unique secret")
         seen_secrets.add(secret)

@@ -14,7 +14,7 @@ from relay import ClientSession, RelayServer, SESSION_TTL
 
 class TestRelayDownlinkAndProbes(unittest.TestCase):
     def setUp(self):
-        self.secret = "unit-test-secret-0123456789"
+        self.secret = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"
         self.client_addr = ("127.0.0.1", 49152)
         self.client_sock = Mock()
         self.adapter = NetworkAdapter("Primary", "192.0.2.10")
@@ -140,7 +140,10 @@ class TestRelayDownlinkAndProbes(unittest.TestCase):
         self.relay.sock.reset_mock()
         self.session.prober.last_probe_time = 0.0
         self.relay._probe_sessions()
-        self.assertEqual(self.relay.sock.sendto.call_count, 1)
+        self.assertEqual(
+            self.relay.sock.sendto.call_count,
+            self.session.prober.CAPACITY_TRAIN_SIZE,
+        )
 
         server_probe = self.relay.sock.sendto.call_args.args[0]
         self.client._on_datagram(server_probe, 1, self.adapter)
@@ -155,14 +158,28 @@ class TestRelayDownlinkAndProbes(unittest.TestCase):
         self.assertEqual(path_metrics.latency_ms, metrics.avg_rtt_ms)
         self.assertEqual(path_metrics.loss_pct, 0.0)
 
+    def test_relay_reorder_hold_tracks_per_session_latency_spread(self):
+        self.session.update_path(1, self.client_addr)
+        fast = self.session.paths[1][3]
+        fast.latency_ms = 12.0
+        fast.jitter_ms = 2.0
+        slow = NetworkAdapter("Secondary", "198.51.100.10")
+        slow.latency_ms = 150.0
+        slow.jitter_ms = 5.0
+        self.session.paths[2] = ("127.0.0.1", 49153, 100.0, slow)
+
+        self.session.tune_reorder_hold()
+
+        self.assertAlmostEqual(self.session.reorder_buffer.max_hold_time, 0.094)
+
 
 class TestRelayClientCredentials(unittest.TestCase):
     def test_per_client_only_relay_rejects_legacy_handshake(self):
         with patch("daemon.AdapterManager"):
-            client = ClientDaemon(secret="legacy-test-secret-0123456789")
+            client = ClientDaemon(secret="ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8")
             relay = RelayServer(
                 secret=None,
-                client_secrets={"alice": "alice-test-secret-0123456789"},
+                client_secrets={"alice": "QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8"},
             )
         relay.sock = Mock()
         init = Packet(
@@ -177,13 +194,13 @@ class TestRelayClientCredentials(unittest.TestCase):
         relay.sock.sendto.assert_not_called()
 
     def test_per_client_key_authenticates_identity_and_wrong_key_creates_no_state(self):
-        alice_secret = "alice-test-secret-0123456789"
-        shared_secret = "legacy-test-secret-0123456789"
+        alice_secret = "QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8"
+        shared_secret = "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8"
         with patch("daemon.AdapterManager"):
             alice = ClientDaemon(secret=alice_secret, client_id="alice")
             relay = RelayServer(
                 secret=shared_secret,
-                client_secrets={"alice": alice_secret, "bob": "bob-test-secret-0123456789"},
+                client_secrets={"alice": alice_secret, "bob": "YGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6e3x9fn8"},
             )
             impersonating_client = ClientDaemon(secret=alice_secret, client_id="bob")
 
@@ -210,7 +227,7 @@ class TestRelayClientCredentials(unittest.TestCase):
         relay.sock.sendto.assert_called_once()
 
         bob = ClientDaemon(
-            secret="bob-test-secret-0123456789",
+            secret="YGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6e3x9fn8",
             client_id="bob",
         )
         bob.session_id = alice.session_id
@@ -233,8 +250,8 @@ class TestRelayMetrics(unittest.TestCase):
         relay = RelayServer(
             host="127.0.0.1",
             port=0,
-            secret="legacy-test-secret-0123456789",
-            client_secrets={"alice": "alice-test-secret-0123456789"},
+            secret="ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8",
+            client_secrets={"alice": "QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8"},
             metrics_port=0,
         )
         relay.total_packets_routed = 3
@@ -261,7 +278,10 @@ class TestRelayMetrics(unittest.TestCase):
             self.assertIn("myspeedify_relay_bytes_routed_total 480", body)
             self.assertIn("myspeedify_relay_authentication_failures_total 2", body)
             self.assertNotIn("alice", body)
-            self.assertNotIn("alice-test-secret", body)
+            self.assertNotIn(
+                "QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8",
+                body,
+            )
             with self.assertRaises(HTTPError) as error:
                 urllib.request.urlopen(url + "/unexpected", timeout=2)
             self.assertEqual(error.exception.code, 404)
@@ -270,7 +290,7 @@ class TestRelayMetrics(unittest.TestCase):
             relay.stop()
 
     def test_expired_session_updates_expiration_counter(self):
-        relay = RelayServer(secret="legacy-test-secret-0123456789")
+        relay = RelayServer(secret="ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8")
         session = ClientSession(
             77, Mock(), b"nonce", b"public-key", b"response", "10.8.0.2",
         )
@@ -288,7 +308,7 @@ class TestRelayMetrics(unittest.TestCase):
     def test_invalid_metrics_port_fails_explicitly(self):
         with patch.dict(os.environ, {"MYSPEEDIFY_METRICS_PORT": "invalid"}):
             with self.assertRaisesRegex(ValueError, "MYSPEEDIFY_METRICS_PORT"):
-                RelayServer(secret="legacy-test-secret-0123456789")
+                RelayServer(secret="ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8")
 
 
 if __name__ == "__main__":

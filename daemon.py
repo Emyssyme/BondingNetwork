@@ -18,7 +18,7 @@ from typing import Dict, List, Optional, Tuple
 from cryptography.exceptions import InvalidTag
 
 from core.protocol import Packet, PacketType, PacketFlag, HEADER_SIZE
-from core.crypto_v2 import TunnelCrypto, derive_psk
+from core.crypto import TunnelCrypto, derive_psk
 from core.handshake import ClientHandshake
 from core.reorder import ReorderBuffer
 from core.adapter import AdapterManager, NetworkAdapter
@@ -42,7 +42,7 @@ class ClientDaemon:
     def __init__(self, server_host: str = "127.0.0.1", server_port: int = 51820,
                  secret: str = "", mode: BondingMode = BondingMode.SPEED,
                  client_id: str | None = None):
-        self.psk = derive_psk(secret)  # raises if secret is empty/short
+        self.psk = derive_psk(secret)
         self.client_id = client_id if client_id is not None else (
             os.environ.get("MYSPEEDIFY_CLIENT_ID") or None
         )
@@ -65,6 +65,7 @@ class ClientDaemon:
         self.prober = LinkProber(interval_seconds=0.4)
         self.scheduler = PacketScheduler(prober=self.prober, mode=mode)
         self.reorder_buffer = ReorderBuffer(max_buffer_size=2048, max_hold_time_ms=30.0)
+        self.reorder_buffer.reset(initial_seq=1)
 
         # path_id -> (socket, adapter). Mutated ONLY by the I/O thread.
         self.paths: Dict[int, Tuple[socket.socket, NetworkAdapter]] = {}
@@ -270,21 +271,24 @@ class ClientDaemon:
     # ----------------------------------------------------------- I/O thread
     def _run(self):
         last_snap = 0.0
-        while self.is_running:
-            try:
-                scan = self._scan_result
-                if scan is not None:
-                    self._scan_result = None
-                    self._apply_adapters(scan)
-                self._io_iteration()
-                now = time.monotonic()
-                if now - last_snap >= SNAPSHOT_EVERY:
-                    last_snap = now
-                    self._update_rates()
-                    self._snapshot = self._build_telemetry()
-            except Exception:
-                self._log_error("loop", "I/O loop error")
-                time.sleep(0.02)
+        try:
+            while self.is_running:
+                try:
+                    scan = self._scan_result
+                    if scan is not None:
+                        self._scan_result = None
+                        self._apply_adapters(scan)
+                    self._io_iteration()
+                    now = time.monotonic()
+                    if now - last_snap >= SNAPSHOT_EVERY:
+                        last_snap = now
+                        self._update_rates()
+                        self._snapshot = self._build_telemetry()
+                except Exception:
+                    self._log_error("loop", "I/O loop error")
+                    time.sleep(0.02)
+        finally:
+            self._snapshot = self._build_telemetry()
 
     def _io_iteration(self):
         busy = False
@@ -374,6 +378,7 @@ class ClientDaemon:
         self.last_rx = 0.0
         self.seq_counter = 0
         self.reorder_buffer = ReorderBuffer(max_buffer_size=2048, max_hold_time_ms=30.0)
+        self.reorder_buffer.reset(initial_seq=1)
         self.prober = LinkProber(interval_seconds=0.4)
         self.scheduler.prober = self.prober
 
@@ -516,6 +521,7 @@ class ClientDaemon:
             m = self.prober.get_path_metrics(pid)
             adp.latency_ms, adp.jitter_ms = m.avg_rtt_ms, m.jitter_ms
             adp.loss_pct = m.loss_rate * 100.0
+            adp.estimated_capacity_bps = m.capacity_bps or 0.0
         elif pkt.pkt_type == PacketType.PROBE_REQ and adp.enabled:
             path = self.paths.get(pid)
             if path is not None:
@@ -560,11 +566,27 @@ class ClientDaemon:
             return
         for _, adp in list(self.paths.values()):
             adp.update_rates(adp.total_tx_bytes, adp.total_rx_bytes)
+        self._tune_reorder_hold()
         up = sum(a.upload_speed_bps for _, a in list(self.paths.values()) if a.enabled)
         down = sum(a.download_speed_bps for _, a in list(self.paths.values()) if a.enabled)
         self.current_upload_mbps = round(up / 1e6, 2)
         self.current_download_mbps = round(down / 1e6, 2)
         self.last_rate_time = now
+
+    def _tune_reorder_hold(self):
+        active = [
+            adapter for _, adapter in self.paths.values()
+            if adapter.enabled and adapter.latency_ms > 0
+        ]
+        if len(active) < 2:
+            return
+        spread = (
+            max(adapter.latency_ms for adapter in active)
+            - min(adapter.latency_ms for adapter in active)
+        ) / 2.0
+        jitter = max(adapter.jitter_ms for adapter in active)
+        hold_ms = min(250.0, max(25.0, spread + 3.0 * jitter + 10.0))
+        self.reorder_buffer.max_hold_time = hold_ms / 1000.0
 
     def _build_telemetry(self) -> dict:
         adapters = []

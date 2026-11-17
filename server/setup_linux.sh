@@ -100,7 +100,7 @@ fi
 
 install -d -o root -g myspeedify -m 0750 "$SECRET_DIR"
 if [[ ! -s "$SECRET_FILE" ]]; then
-    (umask 077; head -c 32 /dev/urandom | base64 > "$SECRET_FILE")
+    (umask 077; python3 -c 'import secrets; print(secrets.token_urlsafe(32))' > "$SECRET_FILE")
 fi
 chown myspeedify:myspeedify "$SECRET_FILE"
 chmod 0600 "$SECRET_FILE"
@@ -114,6 +114,17 @@ sysctl -w net.ipv4.ip_forward=1
 python3 -m venv "$APP_DIR/venv"
 "$APP_DIR/venv/bin/pip" install --upgrade pip
 "$APP_DIR/venv/bin/pip" install --require-hashes -r "$APP_DIR/server/requirements.lock.txt"
+
+if ! PYTHONPATH="$APP_DIR" "$APP_DIR/venv/bin/python" -c '
+from pathlib import Path
+import sys
+from core.crypto import derive_psk
+derive_psk(Path(sys.argv[1]).read_text(encoding="utf-8").strip())
+' "$SECRET_FILE"; then
+    echo "The existing relay secret is not a canonical 32-byte URL-safe key." >&2
+    echo "Run server/rotate_secret.sh, then securely update every client." >&2
+    exit 1
+fi
 
 cat > "$FIREWALL_UNIT" <<EOF
 [Unit]

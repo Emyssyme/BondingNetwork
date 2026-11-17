@@ -22,7 +22,7 @@ from typing import Dict, List, Optional, Tuple
 from cryptography.exceptions import InvalidTag
 
 from core.protocol import Packet, PacketType, PacketFlag, HEADER_SIZE
-from core.crypto_v2 import derive_psk, TunnelCrypto
+from core.crypto import derive_psk, TunnelCrypto
 from core.handshake import (
     INIT_LEGACY_SIZE, MAX_SKEW_MS, parse_init, parse_init_client_id, build_resp,
 )
@@ -67,6 +67,7 @@ class ClientSession:
         self.tunnel_ip = tunnel_ip
         self.ip_bytes = socket.inet_aton(tunnel_ip)
         self.reorder_buffer = ReorderBuffer()
+        self.reorder_buffer.reset(initial_seq=1)
         self.prober = LinkProber()
         self.scheduler = PacketScheduler(self.prober, mode=BondingMode.SPEED)
         # path_id -> (remote_ip, remote_port, last_seen_monotonic, adapter)
@@ -74,6 +75,21 @@ class ClientSession:
         self.replay_windows: Dict[Tuple[int, int], ReplayWindow] = {}
         self.seq_counter = 0
         self.last_activity = time.monotonic()
+
+    def tune_reorder_hold(self):
+        active = [
+            path[3] for path in self.paths.values()
+            if path[3].enabled and path[3].latency_ms > 0
+        ]
+        if len(active) < 2:
+            return
+        spread = (
+            max(adapter.latency_ms for adapter in active)
+            - min(adapter.latency_ms for adapter in active)
+        ) / 2.0
+        jitter = max(adapter.jitter_ms for adapter in active)
+        hold_ms = min(250.0, max(25.0, spread + 3.0 * jitter + 10.0))
+        self.reorder_buffer.max_hold_time = hold_ms / 1000.0
 
     def update_path(self, path_id: int, addr: Tuple[str, int]):
         now = time.monotonic()
@@ -114,15 +130,16 @@ class RelayServer:
         for client_id, client_secret in client_secrets.items():
             if not isinstance(client_id, str) or not is_valid_client_id(client_id):
                 raise ValueError("Client secrets contain an invalid client ID")
-            if not isinstance(client_secret, str) or len(client_secret) < 16:
-                raise ValueError("Each client secret must contain at least 16 characters")
+            if not isinstance(client_secret, str):
+                raise ValueError("Each client secret must be a 32-byte URL-safe base64 value")
             if client_secret == secret or client_secret in seen_client_secrets:
                 raise ValueError("Each client must have a unique secret")
             seen_client_secrets.add(client_secret)
             self.client_psks[client_id] = derive_psk(client_secret)
         if self.psk is None and not self.client_psks:
             raise ValueError(
-                "A relay passphrase is required, or a per-client secret must be configured via "
+                "A random 256-bit relay secret is required, or per-client secrets must be "
+                "configured via "
                 "MYSPEEDIFY_SECRET/MYSPEEDIFY_SECRET_FILE or "
                 "MYSPEEDIFY_CLIENT_SECRETS_FILE."
             )
@@ -358,6 +375,8 @@ class RelayServer:
                 path[3].latency_ms = metrics.avg_rtt_ms
                 path[3].jitter_ms = metrics.jitter_ms
                 path[3].loss_pct = metrics.loss_rate * 100.0
+                path[3].estimated_capacity_bps = metrics.capacity_bps or 0.0
+                session.tune_reorder_hold()
         elif pkt.pkt_type == PacketType.DATA:
             if pkt.flags & PacketFlag.REDUNDANT:
                 session.scheduler.set_mode(BondingMode.REDUNDANT)
@@ -526,7 +545,7 @@ if __name__ == "__main__":
     client_secrets = load_client_secrets()
     if not secret and not client_secrets:
         sys.exit(
-            "Set MYSPEEDIFY_SECRET_FILE/MYSPEEDIFY_SECRET for legacy clients, "
+            "Set MYSPEEDIFY_SECRET_FILE/MYSPEEDIFY_SECRET for shared-key clients, "
             "or MYSPEEDIFY_CLIENT_SECRETS_FILE for per-client authentication."
         )
     RelayServer(
