@@ -56,6 +56,74 @@ class TestTunnelNetworkConfig(unittest.TestCase):
         )
         self.assertTrue(any(command[0] == "ip6tables" and "-D" in command for command in commands))
 
+    def test_linux_installs_ipv4_kill_switch_with_relay_exception(self):
+        tun = Mock()
+        tun.name = "msp0"
+        path = PhysicalPath("eth0", "192.0.2.10", 2)
+        with patch("core.tun.routes.platform.system", return_value="Linux"):
+            config = TunnelNetworkConfig(tun, "198.51.100.10", [path])
+        commands = []
+
+        def run(*command):
+            commands.append(command)
+            if command[:2] in { ("iptables", "-w"), ("ip6tables", "-w") }:
+                return subprocess.CompletedProcess(command, 0, "", "")
+            if command[:5] == ("ip", "-4", "route", "show", "default"):
+                return subprocess.CompletedProcess(command, 0, "default via 192.0.2.1 dev eth0\n", "")
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with patch.object(config, "_run", side_effect=run), \
+                patch.object(config, "_allocate_linux_ids", return_value=(24000, 10000)):
+            config.install()
+
+            self.assertTrue(any(
+                command[:4] == ("iptables", "-w", "-I", "OUTPUT")
+                and "198.51.100.10" in command
+                and "ACCEPT" in command
+                for command in commands
+            ))
+            self.assertTrue(any(
+                command[:4] == ("iptables", "-w", "-I", "OUTPUT")
+                and "!" in command
+                and "DROP" in command
+                for command in commands
+            ))
+
+            config.close()
+            self.assertTrue(any(
+                command[:4] == ("iptables", "-w", "-D", "OUTPUT")
+                and "198.51.100.10" in command
+                and "ACCEPT" in command
+                for command in commands
+            ))
+
+    def test_linux_skips_paths_without_default_route(self):
+        tun = Mock()
+        tun.name = "msp0"
+        valid = PhysicalPath("eth0", "192.0.2.10", 2)
+        invalid = PhysicalPath("eth1", "203.0.113.10", 3)
+        with patch("core.tun.routes.platform.system", return_value="Linux"):
+            config = TunnelNetworkConfig(tun, "198.51.100.10", [valid, invalid])
+        commands = []
+
+        def run(*command):
+            commands.append(command)
+            if command[:5] == ("ip", "-4", "route", "show", "default"):
+                output = "default via 192.0.2.1 dev eth0\n" if command[-1] == "eth0" else ""
+                return subprocess.CompletedProcess(command, 0, output, "")
+            if command == ("ip", "-4", "rule", "show"):
+                return subprocess.CompletedProcess(command, 0, "", "")
+            if command == ("ip6tables", "-w", "-S", "OUTPUT"):
+                return subprocess.CompletedProcess(command, 0, "", "")
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with patch.object(config, "_run", side_effect=run), \
+                patch.object(config, "_allocate_linux_ids", return_value=(24000, 10000)):
+            config.install()
+
+        self.assertEqual({path.interface_name for path in config._paths.values()}, {"eth0"})
+        self.assertIn(("ip", "-4", "route", "add", "0.0.0.0/1", "dev", "msp0"), commands)
+
     def test_linux_setup_failure_rolls_back_installed_routes(self):
         tun = Mock()
         tun.name = "msp0"
@@ -314,12 +382,28 @@ class TestTunnelNetworkConfig(unittest.TestCase):
                 command[0] == "netsh.exe" and "add" in command
                 for command in commands
             ))
+            self.assertTrue(any(
+                command[0] == "netsh.exe"
+                and any("name=MySpeedify-IPv4-Allow-" in str(part) for part in command)
+                for command in commands
+            ))
+            self.assertTrue(any(
+                command[0] == "netsh.exe"
+                and any("name=MySpeedify-IPv4-Block-" in str(part) for part in command)
+                for command in commands
+            ))
             self.assertTrue(any("ServerAddresses '1.1.1.1'" in script for script in scripts))
 
             config.close()
 
         self.assertTrue(any(
             command[0] == "netsh.exe" and "delete" in command
+            for command in commands
+        ))
+        self.assertTrue(any(
+            command[0] == "netsh.exe"
+            and "delete" in command
+            and any("name=MySpeedify-IPv4-Block-" in str(part) for part in command)
             for command in commands
         ))
         self.assertTrue(any(

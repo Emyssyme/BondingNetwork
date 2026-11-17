@@ -35,10 +35,24 @@ DEV = os.environ.get("MYSPEEDIFY_DEV") == "1"
 COOKIE = "msp_session"
 
 
+def _dashboard_hosts(port: int, bind_host: str) -> tuple[set[str], set[str]]:
+    normalized = bind_host.strip()
+    if normalized in {"localhost", "127.0.0.1"}:
+        hosts = {f"127.0.0.1:{port}", f"localhost:{port}"}
+        origins = {f"http://127.0.0.1:{port}", f"http://localhost:{port}"}
+    elif normalized == "::1":
+        hosts = {f"[::1]:{port}", f"127.0.0.1:{port}", f"localhost:{port}"}
+        origins = {f"http://[::1]:{port}", f"http://127.0.0.1:{port}", f"http://localhost:{port}"}
+    else:
+        raise ValueError("dashboard bind host must remain on loopback")
+    return hosts, origins
+
+
 @dataclass
 class APIState:
     daemon: Optional[ClientDaemon] = None
     token: str = ""
+    login_token: str = ""
     allowed_hosts: set[str] = field(default_factory=set)
     allowed_origins: set[str] = field(default_factory=set)
     is_simulating: bool = False
@@ -65,6 +79,11 @@ app = FastAPI(title="MySpeedify VPN Controller", lifespan=lifespan)
 app.state.runtime = APIState()
 
 
+@app.get("/", include_in_schema=False)
+async def landing_page():
+    return RedirectResponse("/index.html")
+
+
 class ModeRequest(BaseModel):
     mode: Literal["speed", "redundant", "failover"]
 
@@ -80,8 +99,18 @@ class AdapterPriorityRequest(BaseModel):
 
 
 def _token_ok(value: Optional[str]) -> bool:
-    token = app.state.runtime.token
-    return bool(value) and hmac.compare_digest(value.encode(), token.encode())
+    state: APIState = app.state.runtime
+    if not value:
+        return False
+    token = state.token
+    login_token = state.login_token
+    return (
+        bool(value)
+        and (
+            (token and hmac.compare_digest(value.encode(), token.encode()))
+            or (login_token and hmac.compare_digest(value.encode(), login_token.encode()))
+        )
+    )
 
 
 def _no_daemon():
@@ -96,10 +125,18 @@ async def guard(request, call_next):
     origin = request.headers.get("origin")
     if origin is not None and origin not in state.allowed_origins:
         return PlainTextResponse("Forbidden origin", status_code=403)
-    if request.url.path == "/" and _token_ok(request.query_params.get("token")):
-        resp = RedirectResponse("/", status_code=303)
-        resp.set_cookie(COOKIE, state.token, httponly=True, samesite="strict", path="/")
-        return resp
+
+    query_token = request.query_params.get("token")
+    if request.url.path == "/" and query_token is not None:
+        if state.login_token and hmac.compare_digest(query_token, state.login_token):
+            resp = RedirectResponse("/", status_code=303)
+            resp.set_cookie(COOKIE, state.token, httponly=True, samesite="strict", path="/")
+            state.login_token = ""
+            return resp
+        if _token_ok(query_token):
+            return RedirectResponse("/", status_code=303)
+        return PlainTextResponse("Unauthorized: token rejected", status_code=401)
+
     if not _token_ok(request.cookies.get(COOKIE)):
         return PlainTextResponse("Unauthorized: open the URL printed at startup", status_code=401)
     return await call_next(request)
@@ -204,13 +241,15 @@ async def websocket_telemetry(websocket: WebSocket):
         pass
 
 
-def init_api(daemon: ClientDaemon, ui_dir: str, port: int) -> str:
+def init_api(daemon: ClientDaemon, ui_dir: str, port: int, bind_host: str = "127.0.0.1") -> str:
     """Wires the daemon, returns the one-time login token for the dashboard URL."""
     state: APIState = app.state.runtime
     state.daemon = daemon
     state.token = secrets.token_urlsafe(32)
-    state.allowed_hosts.update({f"127.0.0.1:{port}", f"localhost:{port}"})
-    state.allowed_origins.update({f"http://127.0.0.1:{port}", f"http://localhost:{port}"})
+    state.login_token = secrets.token_urlsafe(32)
+    safe_hosts, safe_origins = _dashboard_hosts(port, bind_host)
+    state.allowed_hosts.update(safe_hosts)
+    state.allowed_origins.update(safe_origins)
     if os.path.exists(ui_dir):
         app.mount("/", StaticFiles(directory=ui_dir, html=True), name="ui")
-    return state.token
+    return state.login_token

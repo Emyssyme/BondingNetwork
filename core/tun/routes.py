@@ -58,6 +58,17 @@ class TunnelNetworkConfig:
             try:
                 if not self._paths:
                     raise RuntimeError("Cannot enable full-tunnel routes without a physical path")
+                filtered = self._paths_with_default_route()
+                if not filtered:
+                    raise RuntimeError("Cannot enable full-tunnel routes without a valid physical path")
+                if len(filtered) != len(self._paths):
+                    logger.warning(
+                        "Skipping %d physical path(s) without a usable IPv4 default route: %s",
+                        len(self._paths) - len(filtered),
+                        ", ".join(path.interface_name for path in self._paths.values() if path not in filtered),
+                    )
+                    self._paths = {path.key: path for path in filtered}
+                    self._path_counts = {path.key: self._path_counts.get(path.key, 1) for path in filtered}
                 self._cleanup_stale()
                 if self.system == "Linux":
                     self._install_linux()
@@ -135,6 +146,7 @@ class TunnelNetworkConfig:
     def _install_linux(self) -> None:
         tun_name = self.tun.name
         comment = f"msp-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+        relay_comment = f"msp-relay-{os.getpid()}-{uuid.uuid4().hex[:8]}"
         self._run(
             "ip6tables", "-w", "-I", "OUTPUT", "1",
             "!", "-o", "lo", "!", "-o", tun_name,
@@ -142,6 +154,27 @@ class TunnelNetworkConfig:
         )
         self._cleanups.append(lambda: self._run(
             "ip6tables", "-w", "-D", "OUTPUT",
+            "!", "-o", "lo", "!", "-o", tun_name,
+            "-m", "comment", "--comment", comment, "-j", "DROP",
+        ))
+
+        self._run(
+            "iptables", "-w", "-I", "OUTPUT", "1",
+            "-d", self.relay_ip, "-m", "comment", "--comment", relay_comment,
+            "-j", "ACCEPT",
+        )
+        self._cleanups.append(lambda: self._run(
+            "iptables", "-w", "-D", "OUTPUT",
+            "-d", self.relay_ip, "-m", "comment", "--comment", relay_comment,
+            "-j", "ACCEPT",
+        ))
+        self._run(
+            "iptables", "-w", "-I", "OUTPUT", "2",
+            "!", "-o", "lo", "!", "-o", tun_name,
+            "-m", "comment", "--comment", comment, "-j", "DROP",
+        )
+        self._cleanups.append(lambda: self._run(
+            "iptables", "-w", "-D", "OUTPUT",
             "!", "-o", "lo", "!", "-o", tun_name,
             "-m", "comment", "--comment", comment, "-j", "DROP",
         ))
@@ -165,15 +198,39 @@ class TunnelNetworkConfig:
         self._run("resolvectl", "domain", tun_name, "~.")
 
     def _install_windows(self) -> None:
-        rule_name = f"MySpeedify-IPv6-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+        relay_allow_name = f"MySpeedify-IPv4-Allow-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+        relay_block_name = f"MySpeedify-IPv4-Block-{os.getpid()}-{uuid.uuid4().hex[:8]}"
         self._run(
             "netsh.exe", "advfirewall", "firewall", "add", "rule",
-            f"name={rule_name}", "dir=out", "action=block",
+            f"name={relay_allow_name}", "dir=out", "action=allow",
+            f"remoteip={self.relay_ip}", "protocol=IPv4",
+            "profile=any", "enable=yes", "priority=1",
+        )
+        self._cleanups.append(lambda: self._run(
+            "netsh.exe", "advfirewall", "firewall", "delete", "rule",
+            f"name={relay_allow_name}",
+        ))
+
+        self._run(
+            "netsh.exe", "advfirewall", "firewall", "add", "rule",
+            f"name={relay_block_name}", "dir=out", "action=block",
+            "remoteip=0.0.0.0/0", "protocol=IPv4",
+            "profile=any", "enable=yes", "priority=100",
+        )
+        self._cleanups.append(lambda: self._run(
+            "netsh.exe", "advfirewall", "firewall", "delete", "rule",
+            f"name={relay_block_name}",
+        ))
+
+        ipv6_rule_name = f"MySpeedify-IPv6-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+        self._run(
+            "netsh.exe", "advfirewall", "firewall", "add", "rule",
+            f"name={ipv6_rule_name}", "dir=out", "action=block",
             "remoteip=::/0", "profile=any", "enable=yes",
         )
         self._cleanups.append(lambda: self._run(
             "netsh.exe", "advfirewall", "firewall", "delete", "rule",
-            f"name={rule_name}",
+            f"name={ipv6_rule_name}",
         ))
 
         self._cleanups.append(self._clear_path_routes)
@@ -199,6 +256,31 @@ class TunnelNetworkConfig:
             f"Set-DnsClientServerAddress -InterfaceIndex {tun_index} "
             f"-ServerAddresses '{self.dns_server}'"
         )
+
+    def _paths_with_default_route(self) -> List[PhysicalPath]:
+        valid: List[PhysicalPath] = []
+        for path in self._paths.values():
+            try:
+                if self.system == "Linux":
+                    route_output = self._run(
+                        "ip", "-4", "route", "show", "default", "dev", path.interface_name,
+                    ).stdout
+                    if not route_output.strip():
+                        continue
+                elif self.system == "Windows":
+                    gateway = self._powershell(
+                        "$r = Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' "
+                        f"-InterfaceIndex {(path.if_index or self._interface_index(path.interface_name))} | "
+                        "Sort-Object RouteMetric | Select-Object -First 1; if ($null -eq $r) { exit 1 }; $r.NextHop"
+                    )
+                    if not gateway:
+                        continue
+                else:
+                    raise RuntimeError(f"Full-tunnel routing is unsupported on {self.system}")
+                valid.append(path)
+            except Exception:
+                logger.warning("Skipping physical path %s because it has no usable IPv4 default route", path.interface_name)
+        return valid
 
     def _install_path_route(self, relay_ip: str, path: PhysicalPath) -> List[Callable[[], None]]:
         if self.system == "Linux":
@@ -347,25 +429,26 @@ class TunnelNetworkConfig:
                 "to", f"{destination.group(1)}/32",
             )
 
-        output = self._run("ip6tables", "-w", "-S", "OUTPUT").stdout
-        for line in output.splitlines():
-            try:
-                args = shlex.split(line)
-            except ValueError:
-                continue
-            if len(args) < 3 or args[0] != "-A" or args[1] != "OUTPUT":
-                continue
-            try:
-                comment_index = args.index("--comment")
-                comment = args[comment_index + 1]
-            except (ValueError, IndexError):
-                continue
-            if re.fullmatch(r"msp-\d+-[0-9a-f]{8}", comment):
-                self._run("ip6tables", "-w", "-D", "OUTPUT", *args[2:])
+        for chain, command in (("ip6tables", "-S"), ("iptables", "-S")):
+            output = self._run(chain, "-w", command, "OUTPUT").stdout
+            for line in output.splitlines():
+                try:
+                    args = shlex.split(line)
+                except ValueError:
+                    continue
+                if len(args) < 3 or args[0] != "-A" or args[1] != "OUTPUT":
+                    continue
+                try:
+                    comment_index = args.index("--comment")
+                    comment = args[comment_index + 1]
+                except (ValueError, IndexError):
+                    continue
+                if re.fullmatch(r"msp(?:-relay)?-\d+-[0-9a-f]{8}", comment):
+                    self._run(chain, "-w", "-D", "OUTPUT", *args[2:])
 
     def _cleanup_windows_stale(self) -> None:
         raw_rules = self._powershell(
-            "Get-NetFirewallRule -DisplayName 'MySpeedify-IPv6-*' "
+            "Get-NetFirewallRule -DisplayName 'MySpeedify-*' "
             "-ErrorAction SilentlyContinue | "
             "Select-Object -ExpandProperty DisplayName | ConvertTo-Json -Compress"
         )
@@ -376,7 +459,7 @@ class TunnelNetworkConfig:
             if not isinstance(rule_names, list):
                 raise RuntimeError(f"Unexpected MySpeedify firewall rule data: {rule_names!r}")
             for name in rule_names:
-                if isinstance(name, str) and name.startswith("MySpeedify-IPv6-"):
+                if isinstance(name, str) and name.startswith("MySpeedify-"):
                     self._run(
                         "netsh.exe", "advfirewall", "firewall", "delete", "rule",
                         f"name={name}",

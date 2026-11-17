@@ -38,6 +38,7 @@ logger = logging.getLogger("MySpeedify.RelayServer")
 
 BATCH = 64
 MAX_SESSIONS = 253          # one /24 pool: 10.8.0.2 .. 10.8.0.254
+MAX_CLIENT_SESSIONS = 8      # per authenticated client; keeps one user from exhausting the relay
 SESSION_TTL = 120.0         # seconds without authenticated traffic
 PATH_TTL = 10.0             # a path with no authenticated packet for this long gets no downlink
 INIT_REPLAY_TTL = 2 * MAX_SKEW_MS / 1000.0
@@ -159,6 +160,7 @@ class RelayServer:
         self._metrics_thread: Optional[threading.Thread] = None
         self._last_gc = time.monotonic()
         self._seen_init_nonces: OrderedDict[Tuple[Optional[str], int, bytes], float] = OrderedDict()
+        self._sessions_by_client: Dict[str, int] = {}
 
     # ---------------------------------------------------------------- lifecycle
     def start(self):
@@ -467,6 +469,15 @@ class RelayServer:
                 return
             if sess is not None:
                 self._drop_session(sess)
+            if client_id is not None:
+                active = self._sessions_by_client.get(client_id, 0)
+                if active >= MAX_CLIENT_SESSIONS:
+                    logger.warning(
+                        "Client %s reached its session limit (%d); refusing new INIT",
+                        client_id,
+                        MAX_CLIENT_SESSIONS,
+                    )
+                    return
             if len(self.sessions) >= MAX_SESSIONS or not self._free_ips:
                 logger.warning("Session limit reached, INIT refused")
                 return
@@ -482,6 +493,8 @@ class RelayServer:
             with self._metrics_lock:
                 self.sessions[pkt.session_id] = sess
                 self.by_ip[sess.ip_bytes] = sess
+                if client_id is not None:
+                    self._sessions_by_client[client_id] = self._sessions_by_client.get(client_id, 0) + 1
                 self.sessions_created_total += 1
             self._seen_init_nonces[replay_key] = now + INIT_REPLAY_TTL
             logger.info(
@@ -503,6 +516,12 @@ class RelayServer:
         with self._metrics_lock:
             self.sessions.pop(s.session_id, None)
             self.by_ip.pop(s.ip_bytes, None)
+            if s.client_id is not None:
+                active = self._sessions_by_client.get(s.client_id, 0)
+                if active <= 1:
+                    self._sessions_by_client.pop(s.client_id, None)
+                else:
+                    self._sessions_by_client[s.client_id] = active - 1
             self._free_ips.append(s.tunnel_ip)
 
     # ---------------------------------------------------------------- downlink

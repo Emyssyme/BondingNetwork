@@ -1,6 +1,7 @@
 import os
 import unittest
 import urllib.request
+from collections import OrderedDict
 from urllib.error import HTTPError
 from unittest.mock import Mock, patch
 
@@ -174,6 +175,32 @@ class TestRelayDownlinkAndProbes(unittest.TestCase):
 
 
 class TestRelayClientCredentials(unittest.TestCase):
+    def test_per_client_session_limit_blocks_exhaustion(self):
+        alice_secret = "QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8"
+        with patch("daemon.AdapterManager"):
+            relay = RelayServer(
+                secret=None,
+                client_secrets={"alice": alice_secret},
+            )
+        relay.sock = Mock()
+        relay._sessions_by_client.clear()
+        relay._free_ips = [f"10.8.0.{i}" for i in range(2, 10)]
+        with patch.object(relay, "_seen_init_nonces", OrderedDict()), \
+                patch("relay.MAX_CLIENT_SESSIONS", 1):
+            alice = ClientDaemon(secret=alice_secret, client_id="alice")
+            first = Packet(PacketType.HANDSHAKE_INIT, alice.session_id, payload=alice._hs.build_init())
+            relay._handle_init(first, ("127.0.0.1", 49152))
+            self.assertIn(alice.session_id, relay.sessions)
+
+            second_client = ClientDaemon(secret=alice_secret, client_id="alice")
+            second_client.session_id += 1
+            second_client._hs = ClientHandshake(second_client.psk, second_client.session_id, second_client.client_id)
+            second = Packet(PacketType.HANDSHAKE_INIT, second_client.session_id, payload=second_client._hs.build_init())
+            relay._handle_init(second, ("127.0.0.1", 49153))
+
+            self.assertNotIn(second_client.session_id, relay.sessions)
+            self.assertEqual(relay._sessions_by_client["alice"], 1)
+
     def test_per_client_only_relay_rejects_legacy_handshake(self):
         with patch("daemon.AdapterManager"):
             client = ClientDaemon(secret="ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8")

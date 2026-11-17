@@ -1,11 +1,19 @@
 import argparse
+import atexit
+import ipaddress
 import logging
 import logging.handlers
 import os
 from pathlib import Path
+import signal
 import sys
 
 import uvicorn
+
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
 
 import api
 from core.secret import load_secret
@@ -45,13 +53,60 @@ def _port(value: str) -> int:
     return port
 
 
+def _loopback_host(value: str) -> str:
+    candidate = value.strip()
+    if candidate in {"localhost", "127.0.0.1", "::1"}:
+        return candidate
+    try:
+        ip = ipaddress.ip_address(candidate)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("dashboard host must be a loopback address") from exc
+    if ip.is_loopback:
+        return str(ip)
+    raise argparse.ArgumentTypeError("dashboard host must be a loopback address")
+
+
+def acquire_instance_lock(lock_path: Path):
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_file = open(lock_path, "w", encoding="utf-8")
+    try:
+        if os.name == "nt":
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        lock_file.close()
+        raise RuntimeError("Another MySpeedify instance is already running") from exc
+    return lock_file
+
+
+def _prepare_shutdown(daemon, lock_file):
+    if daemon is not None:
+        try:
+            daemon.stop()
+        except Exception:
+            logging.exception("Error while stopping MySpeedify client during shutdown")
+    if lock_file is not None:
+        try:
+            lock_file.close()
+        except Exception:
+            pass
+
+
 def main() -> None:
     _configure_logging()
     parser = argparse.ArgumentParser(description="Run the MySpeedify client and local dashboard.")
     parser.add_argument("--server-host", default="127.0.0.1", help="Relay hostname or IPv4 address")
     parser.add_argument("--port", type=_port, default=51820, help="Relay UDP port")
+    parser.add_argument("--dashboard-host", type=_loopback_host, default="127.0.0.1", help="Dashboard bind host; must stay on loopback")
     parser.add_argument("--dashboard-port", type=_port, default=8088, help="Local dashboard port")
     args = parser.parse_args()
+
+    lock_path = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "MySpeedify" / "instance.lock"
+    try:
+        lock_file = acquire_instance_lock(lock_path)
+    except RuntimeError as exc:
+        parser.error(str(exc))
 
     secret = load_secret()
     if not secret:
@@ -59,18 +114,31 @@ def main() -> None:
 
     daemon = ClientDaemon(server_host=args.server_host, server_port=args.port, secret=secret)
     ui_dir = str(Path(__file__).resolve().parent / "ui")
+
+    def _handle_shutdown(signum=None, frame=None):
+        _prepare_shutdown(daemon, lock_file)
+        raise SystemExit(0 if signum is None else 128 + signum)
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(sig, _handle_shutdown)
+        except (AttributeError, ValueError):
+            pass
+    atexit.register(_prepare_shutdown, daemon, lock_file)
+
     try:
         daemon.start()
-        token = api.init_api(daemon, ui_dir, args.dashboard_port)
-        print(
-            f"MySpeedify dashboard: http://127.0.0.1:{args.dashboard_port}/?token={token}",
-            flush=True,
-        )
-        uvicorn.run(api.app, host="127.0.0.1", port=args.dashboard_port)
+        token = api.init_api(daemon, ui_dir, args.dashboard_port, args.dashboard_host)
+        if args.dashboard_host == "::1":
+            dashboard_url = f"http://[::1]:{args.dashboard_port}/?token={token}"
+        else:
+            dashboard_url = f"http://{args.dashboard_host}:{args.dashboard_port}/?token={token}"
+        print(f"MySpeedify dashboard: {dashboard_url}", flush=True)
+        uvicorn.run(api.app, host=args.dashboard_host, port=args.dashboard_port, access_log=False)
         if daemon.fatal_error:
             raise SystemExit(1)
     finally:
-        daemon.stop()
+        _prepare_shutdown(daemon, lock_file)
 
 
 if __name__ == "__main__":
