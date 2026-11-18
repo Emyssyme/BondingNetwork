@@ -198,44 +198,25 @@ class TunnelNetworkConfig:
         self._run("resolvectl", "domain", tun_name, "~.")
 
     def _install_windows(self) -> None:
-        relay_allow_name = f"MySpeedify-IPv4-Allow-{os.getpid()}-{uuid.uuid4().hex[:8]}"
-        relay_block_name = f"MySpeedify-IPv4-Block-{os.getpid()}-{uuid.uuid4().hex[:8]}"
-        self._run(
-            "netsh.exe", "advfirewall", "firewall", "add", "rule",
-            f"name={relay_allow_name}", "dir=out", "action=allow",
-            f"remoteip={self.relay_ip}", "protocol=IPv4",
-            "profile=any", "enable=yes", "priority=1",
-        )
-        self._cleanups.append(lambda: self._run(
-            "netsh.exe", "advfirewall", "firewall", "delete", "rule",
-            f"name={relay_allow_name}",
-        ))
-
-        self._run(
-            "netsh.exe", "advfirewall", "firewall", "add", "rule",
-            f"name={relay_block_name}", "dir=out", "action=block",
-            "remoteip=0.0.0.0/0", "protocol=IPv4",
-            "profile=any", "enable=yes", "priority=100",
-        )
-        self._cleanups.append(lambda: self._run(
-            "netsh.exe", "advfirewall", "firewall", "delete", "rule",
-            f"name={relay_block_name}",
+        tun_alias = self.tun.adapter_name
+        tunnel_allow_name = f"MySpeedify-IPv4-Tunnel-Allow-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+        self._cleanups.append(self._add_windows_firewall_rule(
+            name=tunnel_allow_name,
+            action="Allow",
+            remote_addresses=["0.0.0.0/0"],
+            interface_alias=tun_alias,
         ))
 
         ipv6_rule_name = f"MySpeedify-IPv6-{os.getpid()}-{uuid.uuid4().hex[:8]}"
-        self._run(
-            "netsh.exe", "advfirewall", "firewall", "add", "rule",
-            f"name={ipv6_rule_name}", "dir=out", "action=block",
-            "remoteip=::/0", "profile=any", "enable=yes",
-        )
-        self._cleanups.append(lambda: self._run(
-            "netsh.exe", "advfirewall", "firewall", "delete", "rule",
-            f"name={ipv6_rule_name}",
+        self._cleanups.append(self._add_windows_firewall_rule(
+            name=ipv6_rule_name,
+            action="Block",
+            remote_addresses=["::/1", "8000::/1"],
         ))
 
         self._cleanups.append(self._clear_path_routes)
         for key, path in self._paths.items():
-            self._path_cleanups[key] = self._install_windows_path(self.relay_ip, path)
+            self._path_cleanups[key] = self._install_path_route(self.relay_ip, path)
 
         tun_index = self._interface_index(self.tun.adapter_name)
         for destination, mask in (
@@ -286,7 +267,14 @@ class TunnelNetworkConfig:
         if self.system == "Linux":
             return self._install_linux_path(relay_ip, path)
         if self.system == "Windows":
-            return self._install_windows_path(relay_ip, path)
+            actions = self._install_windows_path(relay_ip, path)
+            try:
+                actions.extend(self._install_windows_path_firewall(relay_ip, path))
+            except Exception:
+                errors = self._cleanup_actions(actions)
+                self._retired_path_cleanups.extend(action for action, _ in errors)
+                raise
+            return actions
         raise RuntimeError(f"Interface routes are unsupported on {self.system}")
 
     def _install_linux_path(
@@ -373,6 +361,78 @@ class TunnelNetworkConfig:
             gateway, "IF", str(index),
         )]
 
+    def _install_windows_path_firewall(
+        self, relay_ip: str, path: PhysicalPath
+    ) -> List[Callable[[], None]]:
+        actions: List[Callable[[], None]] = []
+        try:
+            allow_name = f"MySpeedify-IPv4-Allow-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+            actions.append(self._add_windows_firewall_rule(
+                name=allow_name,
+                action="Allow",
+                remote_addresses=[relay_ip],
+                interface_alias=path.interface_name,
+            ))
+
+            block_name = f"MySpeedify-IPv4-Block-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+            actions.append(self._add_windows_firewall_rule(
+                name=block_name,
+                action="Block",
+                remote_addresses=self._windows_ipv4_blocklist(relay_ip),
+                interface_alias=path.interface_name,
+            ))
+            return actions
+        except Exception:
+            errors = self._cleanup_actions(actions)
+            self._retired_path_cleanups.extend(action for action, _ in errors)
+            raise
+
+    def _add_windows_firewall_rule(
+        self,
+        name: str,
+        action: str,
+        remote_addresses: List[str],
+        interface_alias: Optional[str] = None,
+    ) -> Callable[[], None]:
+        quoted_addresses = ",".join(self._powershell_quote(value) for value in remote_addresses)
+        interface_filter = (
+            f" -InterfaceAlias {self._powershell_quote(interface_alias)}"
+            if interface_alias is not None
+            else ""
+        )
+        self._powershell(
+            f"New-NetFirewallRule -DisplayName {self._powershell_quote(name)} "
+            f"-Direction Outbound -Action {action} -Profile Any -Enabled True "
+            f"-Protocol Any -RemoteAddress @({quoted_addresses}){interface_filter} "
+            "-ErrorAction Stop | Out-Null"
+        )
+        return lambda: self._powershell(
+            f"Remove-NetFirewallRule -DisplayName {self._powershell_quote(name)} "
+            "-Confirm:$false -ErrorAction Stop"
+        )
+
+    @staticmethod
+    def _powershell_quote(value: str) -> str:
+        return "'" + value.replace("'", "''") + "'"
+
+    @staticmethod
+    def _windows_ipv4_blocklist(relay_ip: str) -> List[str]:
+        relay = ipaddress.IPv4Address(relay_ip)
+        relay_value = int(relay)
+        all_addresses = (1 << 32) - 1
+        blocked = []
+        if relay_value:
+            blocked.extend(ipaddress.summarize_address_range(
+                ipaddress.IPv4Address(0),
+                ipaddress.IPv4Address(relay_value - 1),
+            ))
+        if relay_value < all_addresses:
+            blocked.extend(ipaddress.summarize_address_range(
+                ipaddress.IPv4Address(relay_value + 1),
+                ipaddress.IPv4Address(all_addresses),
+            ))
+        return [str(network) for network in blocked]
+
     def _cleanup_stale(self) -> None:
         if self.system == "Linux":
             self._cleanup_linux_stale()
@@ -447,38 +507,29 @@ class TunnelNetworkConfig:
                     self._run(chain, "-w", "-D", "OUTPUT", *args[2:])
 
     def _cleanup_windows_stale(self) -> None:
-        raw_rules = self._powershell(
-            "Get-NetFirewallRule -DisplayName 'MySpeedify-*' "
-            "-ErrorAction SilentlyContinue | "
-            "Select-Object -ExpandProperty DisplayName | ConvertTo-Json -Compress"
+        self._powershell(
+            "Get-NetFirewallRule -DisplayName 'MySpeedify-*' | "
+            "Remove-NetFirewallRule -Confirm:$false -ErrorAction Stop"
         )
-        if raw_rules:
-            rule_names = json.loads(raw_rules)
-            if isinstance(rule_names, str):
-                rule_names = [rule_names]
-            if not isinstance(rule_names, list):
-                raise RuntimeError(f"Unexpected MySpeedify firewall rule data: {rule_names!r}")
-            for name in rule_names:
-                if isinstance(name, str) and name.startswith("MySpeedify-"):
-                    self._run(
-                        "netsh.exe", "advfirewall", "firewall", "delete", "rule",
-                        f"name={name}",
-                    )
 
         tun_index = self._interface_index(self.tun.adapter_name)
         for destination in ("0.0.0.0/1", "128.0.0.0/1"):
             self._powershell(
                 f"Get-NetRoute -InterfaceIndex {tun_index} -AddressFamily IPv4 "
-                f"-DestinationPrefix '{destination}' -ErrorAction SilentlyContinue | "
-                "Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue"
+                "-ErrorAction SilentlyContinue | "
+                f"Where-Object {{ $_.DestinationPrefix -eq '{destination}' }} | "
+                "ForEach-Object { Remove-NetRoute -InputObject $_ "
+                "-Confirm:$false -ErrorAction Stop }"
             )
         for path in self._paths.values():
             index = path.if_index or self._interface_index(path.interface_name)
             self._powershell(
                 f"Get-NetRoute -InterfaceIndex {index} -AddressFamily IPv4 "
-                f"-DestinationPrefix '{self.relay_ip}/32' -ErrorAction SilentlyContinue | "
-                "Where-Object { $_.RouteMetric -eq 1 } | "
-                "Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue"
+                "-ErrorAction SilentlyContinue | "
+                f"Where-Object {{ $_.DestinationPrefix -eq '{self.relay_ip}/32' "
+                " -and $_.RouteMetric -eq 1 } | "
+                "ForEach-Object { Remove-NetRoute -InputObject $_ "
+                "-Confirm:$false -ErrorAction Stop }"
             )
 
     def _allocate_linux_ids(self) -> Tuple[int, int]:

@@ -1,3 +1,4 @@
+import ipaddress
 import subprocess
 import unittest
 from unittest.mock import Mock, patch
@@ -324,8 +325,6 @@ class TestTunnelNetworkConfig(unittest.TestCase):
 
         def powershell(script):
             scripts.append(script)
-            if "Get-NetFirewallRule" in script:
-                return '["MySpeedify-IPv6-123-abcd","OtherFirewallRule"]'
             return ""
 
         with patch.object(config, "_run", side_effect=run), \
@@ -333,18 +332,21 @@ class TestTunnelNetworkConfig(unittest.TestCase):
                 patch.object(config, "_interface_index", return_value=17):
             config._cleanup_stale()
 
-        self.assertIn(
-            (
-                "netsh.exe", "advfirewall", "firewall", "delete", "rule",
-                "name=MySpeedify-IPv6-123-abcd",
-            ),
-            commands,
-        )
+        self.assertTrue(any(
+            "Get-NetFirewallRule -DisplayName 'MySpeedify-*'" in script
+            and "Remove-NetFirewallRule -Confirm:$false -ErrorAction Stop" in script
+            for script in scripts
+        ))
         self.assertEqual(
             sum("Remove-NetRoute" in script for script in scripts),
             2,
         )
         self.assertTrue(all("-InterfaceIndex 17" in script for script in scripts if "Remove-NetRoute" in script))
+        self.assertTrue(all(
+            "-DestinationPrefix" not in script
+            and "Where-Object { $_.DestinationPrefix -eq" in script
+            for script in scripts if "Remove-NetRoute" in script
+        ))
 
     def test_windows_restores_dns_and_removes_kill_switch(self):
         tun = Mock()
@@ -379,32 +381,39 @@ class TestTunnelNetworkConfig(unittest.TestCase):
                 for command in commands
             ))
             self.assertTrue(any(
-                command[0] == "netsh.exe" and "add" in command
-                for command in commands
+                "New-NetFirewallRule" in script
+                and "-Action Allow" in script
+                and "-RemoteAddress @('198.51.100.10')" in script
+                and "-InterfaceAlias 'Ethernet'" in script
+                for script in scripts
             ))
             self.assertTrue(any(
-                command[0] == "netsh.exe"
-                and any("name=MySpeedify-IPv4-Allow-" in str(part) for part in command)
-                for command in commands
+                "New-NetFirewallRule" in script
+                and "-Action Block" in script
+                and "-InterfaceAlias 'Ethernet'" in script
+                and "'198.51.100.10'" not in script
+                for script in scripts
             ))
             self.assertTrue(any(
-                command[0] == "netsh.exe"
-                and any("name=MySpeedify-IPv4-Block-" in str(part) for part in command)
-                for command in commands
+                "New-NetFirewallRule" in script
+                and "-InterfaceAlias 'MySpeedifyVPN'" in script
+                and "-RemoteAddress @('0.0.0.0/0')" in script
+                for script in scripts
+            ))
+            self.assertTrue(any(
+                "New-NetFirewallRule" in script
+                and "-Action Block" in script
+                and "-RemoteAddress @('::/1','8000::/1')" in script
+                for script in scripts
             ))
             self.assertTrue(any("ServerAddresses '1.1.1.1'" in script for script in scripts))
 
             config.close()
 
         self.assertTrue(any(
-            command[0] == "netsh.exe" and "delete" in command
-            for command in commands
-        ))
-        self.assertTrue(any(
-            command[0] == "netsh.exe"
-            and "delete" in command
-            and any("name=MySpeedify-IPv4-Block-" in str(part) for part in command)
-            for command in commands
+            "Remove-NetFirewallRule -DisplayName 'MySpeedify-IPv4-Block-" in script
+            and "-Confirm:$false -ErrorAction Stop" in script
+            for script in scripts
         ))
         self.assertTrue(any(
             "ServerAddresses @('9.9.9.9')" in script
@@ -413,6 +422,69 @@ class TestTunnelNetworkConfig(unittest.TestCase):
         self.assertTrue(any(
             command[:2] == ("route.exe", "DELETE")
             and command[2] == "0.0.0.0"
+            for command in commands
+        ))
+
+    def test_windows_ipv4_firewall_blocklist_excludes_only_relay(self):
+        tun = Mock()
+        tun.adapter_name = "MySpeedifyVPN"
+        with patch("core.tun.routes.platform.system", return_value="Windows"):
+            config = TunnelNetworkConfig(tun, "198.51.100.10", [])
+
+        networks = [
+            ipaddress.ip_network(value)
+            for value in config._windows_ipv4_blocklist("198.51.100.10")
+        ]
+        relay_ip = ipaddress.ip_address("198.51.100.10")
+
+        self.assertFalse(any(relay_ip in network for network in networks))
+        self.assertEqual(sum(network.num_addresses for network in networks), (1 << 32) - 1)
+
+    def test_windows_dynamic_path_gets_and_removes_scoped_firewall_rules(self):
+        tun = Mock()
+        tun.adapter_name = "MySpeedifyVPN"
+        first = PhysicalPath("Ethernet", "192.0.2.10", 12)
+        second = PhysicalPath("Ethernet 2", "203.0.113.10", 13)
+        with patch("core.tun.routes.platform.system", return_value="Windows"):
+            config = TunnelNetworkConfig(tun, "198.51.100.10", [first])
+        commands = []
+        scripts = []
+
+        def run(*command):
+            commands.append(command)
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        def powershell(script):
+            scripts.append(script)
+            if "Get-NetAdapter" in script:
+                return "3"
+            if "Get-NetRoute" in script:
+                return "192.0.2.1"
+            if "Get-DnsClientServerAddress" in script:
+                return "[]"
+            return ""
+
+        with patch.object(config, "_run", side_effect=run), \
+                patch.object(config, "_powershell", side_effect=powershell):
+            config.install()
+            config.add_path(second)
+            config.remove_path(second)
+            config.close()
+
+        self.assertTrue(any(
+            "New-NetFirewallRule" in script
+            and "-InterfaceAlias 'Ethernet 2'" in script
+            and "-Action Block" in script
+            for script in scripts
+        ))
+        self.assertTrue(any(
+            "Remove-NetFirewallRule -DisplayName 'MySpeedify-IPv4-Block-" in script
+            for script in scripts
+        ))
+        self.assertTrue(any(
+            command[:2] == ("route.exe", "ADD")
+            and command[2] == "198.51.100.10"
+            and "13" in command
             for command in commands
         ))
 
