@@ -190,6 +190,55 @@ class TestClientReconnect(unittest.TestCase):
         self.assertIn("clock synchronization", warning.call_args.args[0])
         self.assertEqual(sock.sendto.call_count, 7)
 
+    def test_initial_handshake_renews_nonce_after_no_response(self):
+        with patch("daemon.AdapterManager"):
+            daemon = ClientDaemon(
+                secret="AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+            )
+        sock = Mock()
+        daemon.paths = {1: (sock, Mock(enabled=True))}
+        daemon.server_addr = ("198.51.100.10", daemon.server_port)
+        original_handshake = daemon._hs
+
+        daemon._handshake_tick(1.0)
+        first_init = sock.sendto.call_args.args[0]
+        daemon._handshake_tick(61.0)
+        second_init = sock.sendto.call_args.args[0]
+
+        self.assertIsNot(daemon._hs, original_handshake)
+        self.assertNotEqual(first_init, second_init)
+        self.assertEqual(sock.sendto.call_count, 2)
+
+    def test_idle_probes_are_small_and_active_traffic_restores_capacity_trains(self):
+        with patch("daemon.AdapterManager"):
+            daemon = ClientDaemon(
+                secret="AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+            )
+        daemon.paths = {1: (Mock(), Mock(enabled=True))}
+        daemon._last_data_activity = 0.0
+        sent = []
+
+        def capture_probe(sock, packet, plaintext):
+            sent.append(packet)
+
+        with patch.object(daemon, "_seal_and_send", side_effect=capture_probe), \
+                patch("daemon.time.monotonic", side_effect=[10.0, 10.0]):
+            daemon._probe_tick()
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(len(sent[0].payload), 20)
+
+        with patch.object(daemon, "_seal_and_send", side_effect=capture_probe), \
+                patch("daemon.time.monotonic", side_effect=[14.9, 14.9]):
+            daemon._probe_tick()
+        self.assertEqual(len(sent), 1)
+
+        daemon._last_data_activity = 14.9
+        with patch.object(daemon, "_seal_and_send", side_effect=capture_probe), \
+                patch("daemon.time.monotonic", side_effect=[15.0, 15.0, 15.0]):
+            daemon._probe_tick()
+        self.assertEqual(len(sent), 5)
+        self.assertTrue(all(len(packet.payload) == 1044 for packet in sent[1:]))
+
     def test_select_waits_for_linux_tun_readiness_instead_of_polling(self):
         with patch("daemon.AdapterManager"):
             daemon = ClientDaemon(secret="AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8")
@@ -274,6 +323,29 @@ class TestClientReconnect(unittest.TestCase):
 
         daemon.network_config.update_relay.assert_called_once_with("198.51.100.20")
         self.assertEqual(daemon.server_addr, ("198.51.100.20", daemon.server_port))
+
+    def test_dns_refresh_allows_private_relays_and_rejects_unusable_addresses(self):
+        with patch("daemon.AdapterManager"), \
+                patch("daemon.socket.gethostbyname", return_value="10.8.0.1"):
+            daemon = ClientDaemon(
+                server_host="relay.example",
+                secret="AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+            )
+            with patch("daemon.time.monotonic", return_value=100.0):
+                daemon._refresh_server_addr()
+
+        self.assertEqual(daemon.server_addr, ("10.8.0.1", daemon.server_port))
+
+        with patch("daemon.AdapterManager"), \
+                patch("daemon.socket.gethostbyname", return_value="0.0.0.0"):
+            invalid = ClientDaemon(
+                server_host="relay.example",
+                secret="AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+            )
+            with patch("daemon.time.monotonic", return_value=100.0):
+                invalid._refresh_server_addr()
+
+        self.assertIsNone(invalid.server_addr)
 
 if __name__ == "__main__":
     unittest.main()

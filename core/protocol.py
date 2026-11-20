@@ -42,6 +42,33 @@ class PacketFlag(IntEnum):
     PROBE = 0x04          # Diagnostic probe packet
     COMPRESSED = 0x08     # Compressed payload
     FAILOVER = 0x10       # Client requests primary/standby downlink scheduling
+    PRIORITY_SECONDARY = 0x20
+    PRIORITY_BACKUP = 0x40
+
+
+_PATH_PRIORITY_MASK = PacketFlag.PRIORITY_SECONDARY | PacketFlag.PRIORITY_BACKUP
+
+
+def encode_path_priority(flags: int, priority: int) -> int:
+    if priority not in (0, 1, 2):
+        raise ValueError("Path priority must be 0, 1, or 2")
+    encoded = int(flags) & ~int(_PATH_PRIORITY_MASK)
+    if priority == 2:
+        encoded |= int(PacketFlag.PRIORITY_SECONDARY)
+    elif priority == 0:
+        encoded |= int(PacketFlag.PRIORITY_BACKUP)
+    return encoded
+
+
+def decode_path_priority(flags: int) -> int | None:
+    priority_bits = int(flags) & int(_PATH_PRIORITY_MASK)
+    if priority_bits == int(PacketFlag.PRIORITY_SECONDARY):
+        return 2
+    if priority_bits == int(PacketFlag.PRIORITY_BACKUP):
+        return 0
+    if priority_bits == 0:
+        return 1
+    return None
 
 class Packet:
     __slots__ = (

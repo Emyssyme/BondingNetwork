@@ -5,7 +5,11 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from core.adapter import AdapterManager, get_windows_interface_indices
-from core.socket_bind import IP_UNICAST_IF, create_bound_udp_socket
+from core.socket_bind import (
+    IP_UNICAST_IF,
+    SO_EXCLUSIVEADDRUSE,
+    create_bound_udp_socket,
+)
 
 
 class FakeSocket:
@@ -49,6 +53,10 @@ class TestSocketBinding(unittest.TestCase):
             (socket.IPPROTO_IP, IP_UNICAST_IF, b"\x00\x00\x00\x0c"),
             fake_socket.options,
         )
+        self.assertIn(
+            (socket.SOL_SOCKET, SO_EXCLUSIVEADDRUSE, 1),
+            fake_socket.options,
+        )
         fake_socket.bind.assert_called_once_with(("192.0.2.10", 0))
         fake_socket.setblocking.assert_called_once_with(False)
 
@@ -62,6 +70,10 @@ class TestSocketBinding(unittest.TestCase):
         self.assertIs(sock, fake_socket)
         self.assertIn(
             (socket.SOL_SOCKET, 25, b"eth0\0"),
+            fake_socket.options,
+        )
+        self.assertIn(
+            (socket.SOL_SOCKET, socket.SO_REUSEADDR, 1),
             fake_socket.options,
         )
         fake_socket.bind.assert_called_once_with(("192.0.2.10", 0))

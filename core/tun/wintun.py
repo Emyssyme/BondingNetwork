@@ -21,6 +21,7 @@ from typing import Optional
 from .base import BaseTunInterface
 from .read_notifier import TunReadNotifier, create_wintun_read_notifier
 from .wintun_integrity import verify_wintun_dll
+from core.windows import system_executable
 
 logger = logging.getLogger("MySpeedify.Wintun")
 
@@ -115,7 +116,8 @@ class WintunInterface(BaseTunInterface):
         return True
 
     def _configure(self):
-        addr_cmd = ["netsh", "interface", "ip", "set", "address",
+        netsh = system_executable("netsh.exe")
+        addr_cmd = [netsh, "interface", "ip", "set", "address",
                     f"name={self.adapter_name}", "static", self.ip, self.netmask]
         last = None
         for _ in range(10):  # the adapter can take a moment to be visible to netsh
@@ -126,7 +128,7 @@ class WintunInterface(BaseTunInterface):
         else:
             raise RuntimeError(f"netsh set address failed: {last.stdout.strip()} {last.stderr.strip()}")
         mtu_command = [
-            "netsh", "interface", "ipv4", "set", "subinterface", self.adapter_name,
+            netsh, "interface", "ipv4", "set", "subinterface", self.adapter_name,
             f"mtu={self.mtu}", "store=active",
         ]
         mtu_result = subprocess.run(

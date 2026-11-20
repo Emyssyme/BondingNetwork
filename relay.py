@@ -13,15 +13,22 @@ import platform
 import select
 import socket
 import sys
+import subprocess
 import threading
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Dict, List, Optional, Tuple
 
 from cryptography.exceptions import InvalidTag
 
-from core.protocol import Packet, PacketType, PacketFlag, HEADER_SIZE
+from core.protocol import (
+    Packet,
+    PacketType,
+    PacketFlag,
+    HEADER_SIZE,
+    decode_path_priority,
+)
 from core.crypto import derive_psk, TunnelCrypto
 from core.handshake import (
     INIT_LEGACY_SIZE, MAX_SKEW_MS, parse_init, parse_init_client_id, build_resp,
@@ -30,7 +37,11 @@ from core.replay import ReplayWindow
 from core.reorder import ReorderBuffer
 from core.scheduler import PacketScheduler, BondingMode
 from core.adapter import NetworkAdapter
-from core.prober import LinkProber
+from core.prober import (
+    ACTIVE_PROBE_WINDOW_SECONDS,
+    IDLE_PROBE_INTERVAL_SECONDS,
+    LinkProber,
+)
 from core.secret import is_valid_client_id, load_client_secrets, load_secret
 from core.tun import TUN_MTU
 
@@ -43,6 +54,11 @@ SESSION_TTL = 120.0         # seconds without authenticated traffic
 PATH_TTL = 10.0             # a path with no authenticated packet for this long gets no downlink
 INIT_REPLAY_TTL = 2 * MAX_SKEW_MS / 1000.0
 INIT_REPLAY_CACHE_LIMIT = MAX_SESSIONS * 16
+INIT_REPLAY_CACHE_PER_CLIENT = 64
+INIT_RATE_LIMIT_PER_CLIENT = 8
+INIT_RATE_WINDOW_SECONDS = 60.0
+IP_REUSE_COOLDOWN = SESSION_TTL
+MAX_PATHS_PER_SESSION = 32
 
 
 def _parse_metrics_port(value: str) -> int:
@@ -76,6 +92,7 @@ class ClientSession:
         self.replay_windows: Dict[Tuple[int, int], ReplayWindow] = {}
         self.seq_counter = 0
         self.last_activity = time.monotonic()
+        self.last_data_activity = self.last_activity
 
     def tune_reorder_hold(self):
         active = [
@@ -150,6 +167,9 @@ class RelayServer:
         self.sessions: Dict[int, ClientSession] = {}
         self.by_ip: Dict[bytes, ClientSession] = {}
         self._free_ips: List[str] = [f"10.8.0.{i}" for i in range(254, 1, -1)]
+        self._quarantined_ips = deque()
+        self._init_cache_counts: Dict[object, int] = {}
+        self._init_rate_attempts: Dict[object, deque] = {}
         self.total_packets_routed = 0
         self.total_bytes_routed = 0
         self.auth_failures_total = 0
@@ -335,7 +355,7 @@ class RelayServer:
             with self._metrics_lock:
                 self.sessions_expired_total += 1
             logger.info("Session %s expired", session.session_id)
-            self._drop_session(session)
+            self._drop_session(session, now=now)
 
     # ------------------------------------------------------------------ uplink
     def _handle_incoming(self, raw: bytes, addr: Tuple[str, int]):
@@ -355,6 +375,15 @@ class RelayServer:
         except InvalidTag:
             self._record_auth_failure()
             return  # spoofed / corrupted: do NOT touch session state
+        if pkt.path_id not in session.paths and len(session.paths) >= MAX_PATHS_PER_SESSION:
+            return
+        priority = (
+            decode_path_priority(pkt.flags)
+            if pkt.pkt_type == PacketType.DATA
+            else None
+        )
+        if pkt.pkt_type == PacketType.DATA and priority is None:
+            return
         replay_window = session.replay_windows.setdefault(
             (pkt.path_id, int(pkt.pkt_type)), ReplayWindow(),
         )
@@ -362,6 +391,9 @@ class RelayServer:
             return
         session.update_path(pkt.path_id, addr)  # only after authentication
 
+        if pkt.pkt_type == PacketType.DISCONNECT:
+            self._drop_session(session)
+            return
         if pkt.pkt_type == PacketType.PROBE_REQ:
             resp = Packet(PacketType.PROBE_RESP, session.session_id, path_id=pkt.path_id,
                           flags=PacketFlag.PROBE, seq_num=pkt.seq_num)
@@ -380,6 +412,8 @@ class RelayServer:
                 path[3].estimated_capacity_bps = metrics.capacity_bps or 0.0
                 session.tune_reorder_hold()
         elif pkt.pkt_type == PacketType.DATA:
+            session.last_data_activity = time.monotonic()
+            session.paths[pkt.path_id][3].priority = priority
             if pkt.flags & PacketFlag.REDUNDANT:
                 session.scheduler.set_mode(BondingMode.REDUNDANT)
             elif pkt.flags & PacketFlag.FAILOVER:
@@ -402,10 +436,18 @@ class RelayServer:
                 for path_id, path in session.paths.items()
                 if now - path[2] < PATH_TTL
             ]
-            if not active_path_ids or not session.prober.should_probe():
+            capacity = (
+                now - session.last_data_activity <= ACTIVE_PROBE_WINDOW_SECONDS
+            )
+            interval = (
+                session.prober.interval
+                if capacity
+                else IDLE_PROBE_INTERVAL_SECONDS
+            )
+            if not active_path_ids or not session.prober.should_probe(interval):
                 continue
             for path_id, pkt in session.prober.generate_probes(
-                active_path_ids, session.session_id,
+                active_path_ids, session.session_id, capacity=capacity,
             ):
                 path = session.paths.get(path_id)
                 if path is None:
@@ -453,6 +495,7 @@ class RelayServer:
         cpub, cnonce = parsed
         now = time.monotonic()
         self._expire_init_replay_cache(now)
+        self._release_quarantined_ips(now)
         sess = self.sessions.get(pkt.session_id)
         if sess is not None and sess.client_id != client_id:
             return
@@ -467,10 +510,15 @@ class RelayServer:
             if len(self._seen_init_nonces) >= INIT_REPLAY_CACHE_LIMIT:
                 logger.warning("INIT replay cache is full; refusing new session")
                 return
-            if sess is not None:
-                self._drop_session(sess)
+            client_key = self._init_client_key(client_id, addr)
+            if self._init_cache_counts.get(client_key, 0) >= INIT_REPLAY_CACHE_PER_CLIENT:
+                logger.warning("Client %s reached the INIT replay-cache limit", client_id or addr[0])
+                return
+            replacement = sess
             if client_id is not None:
                 active = self._sessions_by_client.get(client_id, 0)
+                if replacement is not None and replacement.client_id == client_id:
+                    active -= 1
                 if active >= MAX_CLIENT_SESSIONS:
                     logger.warning(
                         "Client %s reached its session limit (%d); refusing new INIT",
@@ -478,15 +526,37 @@ class RelayServer:
                         MAX_CLIENT_SESSIONS,
                     )
                     return
-            if len(self.sessions) >= MAX_SESSIONS or not self._free_ips:
+            active_sessions = len(self.sessions) - (1 if replacement is not None else 0)
+            if active_sessions >= MAX_SESSIONS:
                 logger.warning("Session limit reached, INIT refused")
                 return
-            ip = self._free_ips.pop()
+            if replacement is not None:
+                ip = replacement.tunnel_ip
+            else:
+                if not self._free_ips:
+                    logger.warning("Tunnel IP pool is cooling down; INIT refused")
+                    return
+                ip = self._free_ips.pop()
+            if self._init_rate_limited(client_key, now):
+                logger.warning("Client %s exceeded the new-session INIT rate limit", client_id or addr[0])
+                if replacement is None:
+                    self._free_ips.append(ip)
+                return
+            try:
+                self._flush_tunnel_ip_conntrack(ip)
+            except (OSError, RuntimeError) as e:
+                if replacement is None:
+                    self._free_ips.append(ip)
+                logger.error("Could not clear stale conntrack state for %s: %s", ip, e)
+                return
             built = build_resp(psk, pkt.session_id, cpub, cnonce, ip)
             if built is None:
-                self._free_ips.append(ip)
+                if replacement is None:
+                    self._free_ips.append(ip)
                 return
             resp_payload, crypto = built
+            if replacement is not None:
+                self._drop_session(replacement, quarantine_ip=False)
             sess = ClientSession(
                 pkt.session_id, crypto, cnonce, cpub, resp_payload, ip, client_id,
             )
@@ -496,7 +566,13 @@ class RelayServer:
                 if client_id is not None:
                     self._sessions_by_client[client_id] = self._sessions_by_client.get(client_id, 0) + 1
                 self.sessions_created_total += 1
-            self._seen_init_nonces[replay_key] = now + INIT_REPLAY_TTL
+            self._seen_init_nonces[replay_key] = (
+                now + INIT_REPLAY_TTL,
+                client_key,
+            )
+            self._init_cache_counts[client_key] = (
+                self._init_cache_counts.get(client_key, 0) + 1
+            )
             logger.info(
                 "Session %s established for client %s, tunnel IP %s",
                 pkt.session_id, client_id or "legacy", ip,
@@ -507,13 +583,64 @@ class RelayServer:
 
     def _expire_init_replay_cache(self, now: float) -> None:
         while self._seen_init_nonces:
-            replay_key, expires_at = next(iter(self._seen_init_nonces.items()))
+            replay_key, (expires_at, client_key) = next(
+                iter(self._seen_init_nonces.items())
+            )
             if expires_at > now:
                 break
             del self._seen_init_nonces[replay_key]
+            remaining = self._init_cache_counts[client_key] - 1
+            if remaining:
+                self._init_cache_counts[client_key] = remaining
+            else:
+                del self._init_cache_counts[client_key]
 
-    def _drop_session(self, s: ClientSession):
+    @staticmethod
+    def _init_client_key(client_id: Optional[str], addr: Tuple[str, int]):
+        return client_id if client_id is not None else ("legacy", addr[0])
+
+    def _init_rate_limited(self, client_key: object, now: float) -> bool:
+        attempts = self._init_rate_attempts.setdefault(client_key, deque())
+        while attempts and now - attempts[0] >= INIT_RATE_WINDOW_SECONDS:
+            attempts.popleft()
+        if not attempts:
+            self._init_rate_attempts.pop(client_key, None)
+            attempts = deque()
+            self._init_rate_attempts[client_key] = attempts
+        if len(attempts) >= INIT_RATE_LIMIT_PER_CLIENT:
+            return True
+        attempts.append(now)
+        return False
+
+    def _release_quarantined_ips(self, now: float) -> None:
+        while self._quarantined_ips and self._quarantined_ips[0][0] <= now:
+            _, tunnel_ip = self._quarantined_ips.popleft()
+            self._free_ips.insert(0, tunnel_ip)
+
+    def _flush_tunnel_ip_conntrack(self, tunnel_ip: str) -> None:
+        if platform.system() != "Linux" or self.tun is None:
+            return
+        result = subprocess.run(
+            ["conntrack", "-D", "--orig-src", tunnel_ip],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode:
+            detail = result.stderr.strip() or result.stdout.strip()
+            raise RuntimeError(
+                f"conntrack deletion failed with exit code {result.returncode}: {detail}"
+            )
+
+    def _drop_session(
+        self,
+        s: ClientSession,
+        *,
+        quarantine_ip: bool = True,
+        now: Optional[float] = None,
+    ) -> None:
         with self._metrics_lock:
+            if self.sessions.get(s.session_id) is not s:
+                return
             self.sessions.pop(s.session_id, None)
             self.by_ip.pop(s.ip_bytes, None)
             if s.client_id is not None:
@@ -522,7 +649,14 @@ class RelayServer:
                     self._sessions_by_client.pop(s.client_id, None)
                 else:
                     self._sessions_by_client[s.client_id] = active - 1
-            self._free_ips.append(s.tunnel_ip)
+            if quarantine_ip:
+                self._quarantined_ips.append(
+                    (
+                        (time.monotonic() if now is None else now)
+                        + IP_REUSE_COOLDOWN,
+                        s.tunnel_ip,
+                    )
+                )
 
     # ---------------------------------------------------------------- downlink
     def _handle_downlink(self, ip_pkt: bytes):
@@ -532,6 +666,7 @@ class RelayServer:
         if s is None:
             return
         now = time.monotonic()
+        s.last_data_activity = now
         live = [(pid, st[3]) for pid, st in s.paths.items() if now - st[2] < PATH_TTL]
         if not live:
             return

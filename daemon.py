@@ -7,6 +7,7 @@ daemon state: they read an immutable telemetry snapshot published atomically by 
 """
 
 import logging
+import ipaddress
 import os
 import secrets
 import select
@@ -17,14 +18,25 @@ from typing import Dict, List, Optional, Tuple
 
 from cryptography.exceptions import InvalidTag
 
-from core.protocol import Packet, PacketType, PacketFlag, HEADER_SIZE
+from core.protocol import (
+    Packet,
+    PacketType,
+    PacketFlag,
+    HEADER_SIZE,
+    encode_path_priority,
+)
 from core.crypto import TunnelCrypto, derive_psk
 from core.handshake import ClientHandshake
 from core.reorder import ReorderBuffer
 from core.adapter import AdapterManager, NetworkAdapter
 from core.socket_bind import create_bound_udp_socket
-from core.prober import LinkProber
+from core.prober import (
+    ACTIVE_PROBE_WINDOW_SECONDS,
+    IDLE_PROBE_INTERVAL_SECONDS,
+    LinkProber,
+)
 from core.scheduler import PacketScheduler, BondingMode
+from core.replay import ReplayWindow
 from core.tun import create_tun, TUN_MTU
 from core.tun.routes import PhysicalPath, TunnelNetworkConfig
 
@@ -35,6 +47,7 @@ SNAPSHOT_EVERY = 0.25
 SCAN_EVERY = 3.0
 DNS_REFRESH_EVERY = 15.0
 RX_TIMEOUT = 10.0
+INITIAL_HANDSHAKE_RENEW_SECONDS = 60.0
 MAX_IO_WAIT = 0.05
 
 
@@ -58,6 +71,7 @@ class ClientDaemon:
         self.network_config: Optional[TunnelNetworkConfig] = None
         self._hs = ClientHandshake(self.psk, self.session_id, self.client_id)
         self._last_init = 0.0
+        self._handshake_started_at: Optional[float] = None
         self._handshake_attempts = 0
         self._last_handshake_warning: Optional[float] = None
 
@@ -76,6 +90,8 @@ class ClientDaemon:
         self.is_running = False
         self.fatal_error: Optional[str] = None
         self.last_rx = 0.0
+        self._last_data_activity = time.monotonic()
+        self.replay_windows: Dict[Tuple[int, int], ReplayWindow] = {}
         self._busy = False
 
         self.start_time = time.time()
@@ -114,6 +130,9 @@ class ClientDaemon:
             self._thread.join(timeout=2.0)
         if self._scan_thread and self._scan_thread is not threading.current_thread():
             self._scan_thread.join(timeout=2.0)
+        if self._thread and self._thread.is_alive():
+            raise RuntimeError("Client I/O thread did not stop; refusing concurrent cleanup")
+        self._send_disconnect()
         cleanup_error = None
         if self.network_config:
             try:
@@ -133,6 +152,27 @@ class ClientDaemon:
         logger.info("MySpeedify Client stopped.")
         if cleanup_error:
             raise RuntimeError(f"Could not restore tunnel network settings: {cleanup_error}") from cleanup_error
+
+    def _send_disconnect(self) -> None:
+        if self.crypto is None:
+            return
+        for path_id, (sock, adapter) in list(self.paths.items()):
+            if not adapter.enabled:
+                continue
+            self.seq_counter += 1
+            packet = Packet(
+                PacketType.DISCONNECT,
+                self.session_id,
+                path_id=path_id,
+                seq_num=self.seq_counter,
+            )
+            try:
+                self._seal_and_send(sock, packet, b"")
+            except OSError as e:
+                logger.warning(
+                    "Could not send session disconnect on path %d: %s", path_id, e,
+                )
+        self.crypto = None
 
     def _log_error(self, key: str, msg: str):
         """Logs with traceback at most once per 5 s per key (never silent, never a flood)."""
@@ -166,6 +206,15 @@ class ClientDaemon:
             resolved_ip = socket.gethostbyname(self.server_host)
         except OSError as e:
             logger.warning("Could not resolve relay host %s: %s", self.server_host, e)
+            return
+        address = ipaddress.IPv4Address(resolved_ip)
+        if (
+            address.is_unspecified
+            or address.is_multicast
+            or address.is_reserved
+            or address == ipaddress.IPv4Address("255.255.255.255")
+        ):
+            logger.error("Refusing unusable relay address %s for %s", resolved_ip, self.server_host)
             return
 
         resolved_addr = (resolved_ip, self.server_port)
@@ -373,9 +422,12 @@ class ClientDaemon:
         self.crypto = None
         self._hs = ClientHandshake(self.psk, self.session_id, self.client_id)
         self._last_init = 0.0
+        self._handshake_started_at = None
         self._handshake_attempts = 0
         self._last_handshake_warning = None
         self.last_rx = 0.0
+        self._last_data_activity = time.monotonic()
+        self.replay_windows.clear()
         self.seq_counter = 0
         self.reorder_buffer = ReorderBuffer(max_buffer_size=2048, max_hold_time_ms=30.0)
         self.reorder_buffer.reset(initial_seq=1)
@@ -386,6 +438,17 @@ class ClientDaemon:
         server_addr = self.server_addr
         if server_addr is None:
             return
+        if (
+            self._handshake_started_at is not None
+            and now - self._handshake_started_at >= INITIAL_HANDSHAKE_RENEW_SECONDS
+        ):
+            logger.warning(
+                "No handshake response after %.0f seconds; creating a fresh handshake",
+                now - self._handshake_started_at,
+            )
+            self._hs = ClientHandshake(self.psk, self.session_id, self.client_id)
+            self._handshake_attempts = 0
+            self._handshake_started_at = None
         if now - self._last_init < 1.0:
             return
         self._last_init = now
@@ -401,6 +464,8 @@ class ClientDaemon:
             except OSError as e:
                 logger.debug("INIT send error on path %d: %s", pid, e)
         if attempted:
+            if self._handshake_started_at is None:
+                self._handshake_started_at = now
             self._handshake_attempts += 1
             if (
                 self._handshake_attempts >= 5
@@ -467,6 +532,7 @@ class ClientDaemon:
         self.tunnel_ip = ip
         self.last_rx = time.monotonic()
         self.crypto = crypto
+        self._handshake_started_at = None
         self._handshake_attempts = 0
         self._last_handshake_warning = None
         logger.info("Handshake complete, tunnel IP %s", ip)
@@ -481,13 +547,29 @@ class ClientDaemon:
         pkt.payload = self.crypto.encrypt(plaintext, pkt.seq_num, pkt.path_id, int(pkt.pkt_type), aad)
         raw = pkt.serialize()
         sock.sendto(raw, server_addr)
+        self.total_tx_bytes += len(raw)
+        self.total_tx_packets += 1
+        entry = self._sock_map.get(sock)
+        if entry is not None:
+            _, adapter = entry
+            adapter.total_tx_bytes += len(raw)
+        else:
+            for path_sock, adapter in self.paths.values():
+                if path_sock is sock:
+                    adapter.total_tx_bytes += len(raw)
+                    break
         return len(raw)
 
     def _probe_tick(self):
-        if not self.prober.should_probe():
+        now = time.monotonic()
+        capacity = now - self._last_data_activity <= ACTIVE_PROBE_WINDOW_SECONDS
+        interval = self.prober.interval if capacity else IDLE_PROBE_INTERVAL_SECONDS
+        if not self.prober.should_probe(interval):
             return
         ids = [pid for pid, (_, adp) in self.paths.items() if adp.enabled]
-        for pid, pkt in self.prober.generate_probes(ids, self.session_id):
+        for pid, pkt in self.prober.generate_probes(
+            ids, self.session_id, capacity=capacity,
+        ):
             sock, _ = self.paths[pid]
             try:
                 self._seal_and_send(sock, pkt, pkt.payload)
@@ -509,6 +591,12 @@ class ClientDaemon:
                                         int(pkt.pkt_type), data[:HEADER_SIZE])
         except InvalidTag:
             self.auth_failures += 1
+            return
+
+        replay_window = self.replay_windows.setdefault(
+            (pkt.path_id, int(pkt.pkt_type)), ReplayWindow(),
+        )
+        if not replay_window.accept(pkt.seq_num):
             return
 
         self.last_rx = time.monotonic()
@@ -537,6 +625,7 @@ class ClientDaemon:
                 except OSError as e:
                     logger.debug("Probe response send error on path %d: %s", pid, e)
         elif pkt.pkt_type == PacketType.DATA and self.tun is not None:
+            self._last_data_activity = self.last_rx
             for ready in self.reorder_buffer.push(pkt.seq_num, plain):
                 self.tun.write(ready)
 
@@ -545,19 +634,18 @@ class ClientDaemon:
         active = [(pid, adp) for pid, (_, adp) in self.paths.items() if adp.enabled]
         if not active:
             return
+        self._last_data_activity = time.monotonic()
         self.seq_counter += 1  # incremented only when the packet is really scheduled (no artificial gaps)
         seq = self.seq_counter
         for pid, pkt in self.scheduler.schedule(payload=ip_payload, seq_num=seq,
                                                 session_id=self.session_id, active_adapters=active):
             sock, adp = self.paths[pid]
+            pkt.flags = encode_path_priority(pkt.flags, adp.priority)
             try:
-                n = self._seal_and_send(sock, pkt, ip_payload)
+                self._seal_and_send(sock, pkt, ip_payload)
             except OSError as e:
                 logger.debug("Send error on path %d: %s", pid, e)
                 continue
-            adp.total_tx_bytes += n
-            self.total_tx_bytes += n
-            self.total_tx_packets += 1
 
     # ------------------------------------------------------------ telemetry
     def _update_rates(self):

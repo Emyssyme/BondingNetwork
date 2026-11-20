@@ -80,14 +80,18 @@ done
 echo "Installing MySpeedify v2 relay dependencies..."
 apt-get update
 DEBIAN_FRONTEND=noninteractive apt-get install -y \
-    python3 python3-venv iptables iproute2
+    python3 python3-venv iptables iproute2 conntrack rsync
 modprobe tun
 
 install -d -o root -g root -m 0755 "$APP_DIR"
 if [[ "$REPO_ROOT" != "$APP_DIR" ]]; then
-    cp -r "$REPO_ROOT/core" "$APP_DIR/"
-    cp "$REPO_ROOT/relay.py" "$APP_DIR/"
-    cp -r "$REPO_ROOT/server" "$APP_DIR/"
+    rsync -a --delete "$REPO_ROOT/core/" "$APP_DIR/core/"
+    install -m 0644 "$REPO_ROOT/relay.py" "$APP_DIR/relay.py"
+    rsync -a --delete \
+        --exclude='clients.json' \
+        --exclude='client_secrets.json' \
+        --exclude='client-secrets.json' \
+        "$REPO_ROOT/server/" "$APP_DIR/server/"
 fi
 
 if ! getent group myspeedify >/dev/null 2>&1; then
@@ -112,7 +116,6 @@ fi
 sysctl -w net.ipv4.ip_forward=1
 
 python3 -m venv "$APP_DIR/venv"
-"$APP_DIR/venv/bin/pip" install --upgrade pip
 "$APP_DIR/venv/bin/pip" install --require-hashes -r "$APP_DIR/server/requirements.lock.txt"
 
 if ! PYTHONPATH="$APP_DIR" "$APP_DIR/venv/bin/python" -c '
@@ -177,6 +180,10 @@ DeviceAllow=/dev/urandom r
 RestrictSUIDSGID=yes
 LockPersonality=yes
 DeviceAllow=/dev/net/tun rw
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
 
 [Install]
 WantedBy=multi-user.target

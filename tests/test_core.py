@@ -7,7 +7,14 @@ import socket
 import struct
 from types import SimpleNamespace
 from unittest.mock import patch
-from core.protocol import Packet, PacketType, PacketFlag, ProbeData
+from core.protocol import (
+    Packet,
+    PacketType,
+    PacketFlag,
+    ProbeData,
+    decode_path_priority,
+    encode_path_priority,
+)
 from core.reorder import ReorderBuffer
 from core.replay import ReplayWindow
 from core.scheduler import PacketScheduler, BondingMode
@@ -108,6 +115,16 @@ class TestMySpeedifyCore(unittest.TestCase):
         self.assertEqual(deserialized.seq_num, 987654321)
         self.assertEqual(deserialized.payload, original_payload)
 
+    def test_path_priority_flags_round_trip_without_changing_existing_flags(self):
+        for priority in (0, 1, 2):
+            flags = encode_path_priority(PacketFlag.FAILOVER, priority)
+            self.assertEqual(decode_path_priority(flags), priority)
+            self.assertTrue(flags & PacketFlag.FAILOVER)
+
+        self.assertIsNone(decode_path_priority(0x60))
+        with self.assertRaisesRegex(ValueError, "priority"):
+            encode_path_priority(PacketFlag.NONE, 3)
+
     def test_reorder_buffer_out_of_order(self):
         """Tests reassembly when packets arrive out of order (e.g. 0, 2, 1, 3)"""
         reorder = ReorderBuffer(max_hold_time_ms=50.0)
@@ -184,6 +201,30 @@ class TestMySpeedifyCore(unittest.TestCase):
             manager.refresh_adapters()
             self.assertEqual(descriptions.call_count, 3)
             self.assertEqual(indices.call_count, 3)
+
+    def test_adapter_scan_ignores_myspeedify_tun_interfaces(self):
+        addresses = {
+            "msp0": [
+                SimpleNamespace(family=socket.AF_INET, address="10.8.0.2"),
+            ],
+            "msps0": [
+                SimpleNamespace(family=socket.AF_INET, address="10.8.0.3"),
+            ],
+            "eth0": [
+                SimpleNamespace(family=socket.AF_INET, address="192.0.2.10"),
+            ],
+        }
+        stats = {
+            name: SimpleNamespace(isup=True)
+            for name in addresses
+        }
+        with patch("core.adapter.psutil.net_if_addrs", return_value=addresses), \
+                patch("core.adapter.psutil.net_if_stats", return_value=stats), \
+                patch("core.adapter.get_windows_adapter_descriptions", return_value={}), \
+                patch("core.adapter.get_windows_interface_indices", return_value={}):
+            adapters = AdapterManager().get_active_adapters()
+
+        self.assertEqual([adapter.interface_name for adapter in adapters], ["eth0"])
 
     def test_reorder_buffer_reports_next_expiry_deadline(self):
         reorder = ReorderBuffer(max_hold_time_ms=30.0)
@@ -460,6 +501,15 @@ class TestMySpeedifyCore(unittest.TestCase):
             (LinkProber.CAPACITY_PROBE_PADDING + ProbeData.SIZE) * 3 * 8 / 0.03
         )
         self.assertAlmostEqual(metrics.capacity_bps, expected)
+
+    def test_idle_probe_is_small_and_does_not_create_a_capacity_sample(self):
+        prober = LinkProber()
+        with patch("core.prober.time.monotonic", return_value=100.0):
+            probes = prober.generate_probes([1], session_id=1, capacity=False)
+
+        self.assertEqual(len(probes), 1)
+        self.assertEqual(len(probes[0][1].payload), ProbeData.SIZE)
+        self.assertEqual(prober.get_path_metrics(1).capacity_bps, None)
 
     def test_late_probe_response_does_not_mark_path_alive(self):
         metrics = LinkProber().get_path_metrics(1)

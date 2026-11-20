@@ -1,4 +1,5 @@
 import asyncio
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -79,6 +80,45 @@ class TestDashboardAPI(unittest.TestCase):
         self.assertEqual(main._loopback_host("127.0.0.1"), "127.0.0.1")
         with self.assertRaisesRegex(Exception, "loopback"):
             main._loopback_host("0.0.0.0")
+
+    def test_client_parser_uses_relay_environment_defaults(self):
+        with patch.dict(
+            os.environ,
+            {
+                "MYSPEEDIFY_SERVER_HOST": "relay.example",
+                "MYSPEEDIFY_SERVER_PORT": "51900",
+            },
+        ):
+            args = main._create_argument_parser().parse_args([])
+
+        self.assertEqual(args.server_host, "relay.example")
+        self.assertEqual(args.port, 51900)
+
+    def test_cleanup_option_does_not_require_a_client_secret(self):
+        args = main._create_argument_parser().parse_args(["--cleanup"])
+
+        self.assertTrue(args.cleanup)
+
+    def test_cleanup_continues_without_relay_routes_when_dns_fails(self):
+        tun = Mock()
+        network_config = Mock()
+        with patch("main.socket.gethostbyname", side_effect=OSError("DNS unavailable")), \
+                patch("main.create_tun", return_value=tun), \
+                patch("main.TunnelNetworkConfig", return_value=network_config) as create_config:
+            main._cleanup_stale_network_state("relay.example")
+
+        create_config.assert_called_once_with(tun, "127.0.0.1", [])
+        network_config.cleanup_stale.assert_called_once_with()
+
+    def test_console_close_events_run_shutdown(self):
+        shutdown = Mock()
+        handler = main._make_console_control_handler(shutdown)
+
+        self.assertFalse(handler(0))
+        self.assertTrue(handler(main.CTRL_CLOSE_EVENT))
+        self.assertTrue(handler(main.CTRL_LOGOFF_EVENT))
+        self.assertTrue(handler(main.CTRL_SHUTDOWN_EVENT))
+        self.assertEqual(shutdown.call_count, 3)
 
     def test_shutdown_cleanup_stops_daemon_and_closes_lock(self):
         daemon = Mock()

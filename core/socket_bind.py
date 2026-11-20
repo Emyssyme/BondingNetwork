@@ -14,6 +14,7 @@ logger = logging.getLogger("MySpeedify.SocketBind")
 
 # Windows socket option constant for IP_UNICAST_IF
 IP_UNICAST_IF = 31
+SO_EXCLUSIVEADDRUSE = getattr(socket, "SO_EXCLUSIVEADDRUSE", 0x4)
 
 def create_bound_udp_socket(
     local_ip: str = "0.0.0.0",
@@ -27,14 +28,17 @@ def create_bound_udp_socket(
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
     try:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        system = platform.system()
+        if system == "Windows":
+            sock.setsockopt(socket.SOL_SOCKET, SO_EXCLUSIVEADDRUSE, 1)
+        else:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024)
         except OSError as e:
             logger.debug("Could not expand socket buffer: %s", e)
 
-        system = platform.system()
         if system == "Windows":
             if if_index is None and interface_name:
                 if_index = socket.if_nametoindex(interface_name)

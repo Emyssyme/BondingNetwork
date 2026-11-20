@@ -1,2 +1,17 @@
 __pycache__/
 *.py[cod]
+/build/
+/dist/
+/dist-installer/
+.venv/
+venv/
+.env
+.env.*
+*.log
+*.secret
+/secret
+/secrets/
+/client_secrets.json
+/client-secrets.json
+/clients.json
+/server/clients.json

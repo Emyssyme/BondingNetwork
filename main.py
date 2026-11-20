@@ -1,12 +1,15 @@
 import argparse
 import atexit
+import ctypes
 import ipaddress
 import logging
 import logging.handlers
 import os
 from pathlib import Path
+import socket
 import signal
 import sys
+from ctypes import wintypes
 
 import uvicorn
 
@@ -16,8 +19,17 @@ else:
     import fcntl
 
 import api
+from core.adapter import AdapterManager
 from core.secret import load_secret
+from core.tun import create_tun
+from core.tun.routes import PhysicalPath, TunnelNetworkConfig
 from daemon import ClientDaemon
+
+CTRL_CLOSE_EVENT = 2
+CTRL_LOGOFF_EVENT = 5
+CTRL_SHUTDOWN_EVENT = 6
+
+logger = logging.getLogger("MySpeedify.Client")
 
 
 def _configure_logging() -> None:
@@ -93,13 +105,87 @@ def _prepare_shutdown(daemon, lock_file):
             pass
 
 
-def main() -> None:
-    _configure_logging()
+def _cleanup_stale_network_state(server_host: str) -> None:
+    try:
+        relay_ip = socket.gethostbyname(server_host)
+    except OSError as exc:
+        logger.warning(
+            "Could not resolve relay host %s; cleanup will omit relay-specific routes: %s",
+            server_host,
+            exc,
+        )
+        relay_ip = "127.0.0.1"
+        paths = []
+    else:
+        paths = [
+            PhysicalPath(adapter.interface_name, adapter.ip, adapter.if_index)
+            for adapter in AdapterManager().get_active_adapters()
+        ]
+
+    TunnelNetworkConfig(create_tun(), relay_ip, paths).cleanup_stale()
+
+
+def _make_console_control_handler(shutdown):
+    def handle(control_type):
+        if control_type not in {
+            CTRL_CLOSE_EVENT,
+            CTRL_LOGOFF_EVENT,
+            CTRL_SHUTDOWN_EVENT,
+        }:
+            return False
+        shutdown()
+        return True
+
+    return handle
+
+
+def _register_console_control_handler(shutdown):
+    if os.name != "nt":
+        return None
+    callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.DWORD)
+    callback = callback_type(_make_console_control_handler(shutdown))
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.SetConsoleCtrlHandler.argtypes = [callback_type, wintypes.BOOL]
+    kernel32.SetConsoleCtrlHandler.restype = wintypes.BOOL
+    if not kernel32.SetConsoleCtrlHandler(callback, True):
+        raise ctypes.WinError(ctypes.get_last_error())
+    return kernel32, callback
+
+
+def _unregister_console_control_handler(registration) -> None:
+    if registration is None:
+        return
+    kernel32, callback = registration
+    if not kernel32.SetConsoleCtrlHandler(callback, False):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def _create_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run the MySpeedify client and local dashboard.")
-    parser.add_argument("--server-host", default="127.0.0.1", help="Relay hostname or IPv4 address")
-    parser.add_argument("--port", type=_port, default=51820, help="Relay UDP port")
+    parser.add_argument(
+        "--server-host",
+        default=os.environ.get("MYSPEEDIFY_SERVER_HOST", "127.0.0.1"),
+        help="Relay hostname or IPv4 address",
+    )
+    parser.add_argument(
+        "--port",
+        type=_port,
+        default=os.environ.get("MYSPEEDIFY_SERVER_PORT", "51820"),
+        help="Relay UDP port",
+    )
     parser.add_argument("--dashboard-host", type=_loopback_host, default="127.0.0.1", help="Dashboard bind host; must stay on loopback")
     parser.add_argument("--dashboard-port", type=_port, default=8088, help="Local dashboard port")
+    parser.add_argument(
+        "--cleanup",
+        action="store_true",
+        help="Remove stale MySpeedify firewall and tunnel routing state",
+    )
+    return parser
+
+
+def main() -> None:
+    _configure_logging()
+    parser = _create_argument_parser()
     args = parser.parse_args()
 
     lock_path = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "MySpeedify" / "instance.lock"
@@ -107,6 +193,15 @@ def main() -> None:
         lock_file = acquire_instance_lock(lock_path)
     except RuntimeError as exc:
         parser.error(str(exc))
+
+    if args.cleanup:
+        try:
+            _cleanup_stale_network_state(args.server_host)
+        except (OSError, RuntimeError, ValueError) as exc:
+            parser.error(f"Could not clean stale MySpeedify network state: {exc}")
+        finally:
+            lock_file.close()
+        return
 
     secret = load_secret()
     if not secret:
@@ -126,6 +221,9 @@ def main() -> None:
             pass
     atexit.register(_prepare_shutdown, daemon, lock_file)
 
+    console_registration = _register_console_control_handler(
+        lambda: _prepare_shutdown(daemon, lock_file),
+    )
     try:
         daemon.start()
         token = api.init_api(daemon, ui_dir, args.dashboard_port, args.dashboard_host)
@@ -138,7 +236,10 @@ def main() -> None:
         if daemon.fatal_error:
             raise SystemExit(1)
     finally:
-        _prepare_shutdown(daemon, lock_file)
+        try:
+            _unregister_console_control_handler(console_registration)
+        finally:
+            _prepare_shutdown(daemon, lock_file)
 
 
 if __name__ == "__main__":

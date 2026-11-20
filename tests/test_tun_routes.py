@@ -7,6 +7,21 @@ from core.tun.routes import PhysicalPath, TunnelNetworkConfig
 
 
 class TestTunnelNetworkConfig(unittest.TestCase):
+    def test_windows_stale_cleanup_succeeds_when_tun_adapter_is_missing(self):
+        tun = Mock()
+        tun.adapter_name = "MySpeedifyVPN"
+        with patch("core.tun.routes.platform.system", return_value="Windows"):
+            config = TunnelNetworkConfig(tun, "198.51.100.10", [])
+        with patch.object(config, "_powershell") as powershell, \
+                patch.object(
+                    config,
+                    "_interface_index",
+                    side_effect=RuntimeError("adapter not found"),
+                ):
+            config.cleanup_stale()
+
+        powershell.assert_called_once()
+
     def test_linux_installs_full_tunnel_and_restores_settings(self):
         tun = Mock()
         tun.name = "msp0"
@@ -375,7 +390,8 @@ class TestTunnelNetworkConfig(unittest.TestCase):
                 patch.object(config, "_powershell", side_effect=powershell):
             config.install()
             self.assertTrue(any(
-                command[:2] == ("route.exe", "ADD")
+                command[0].lower().endswith("route.exe")
+                and command[1] == "ADD"
                 and command[2] == "0.0.0.0"
                 and command[4] == "128.0.0.0"
                 for command in commands
@@ -420,7 +436,8 @@ class TestTunnelNetworkConfig(unittest.TestCase):
             for script in scripts
         ))
         self.assertTrue(any(
-            command[:2] == ("route.exe", "DELETE")
+            command[0].lower().endswith("route.exe")
+            and command[1] == "DELETE"
             and command[2] == "0.0.0.0"
             for command in commands
         ))
@@ -482,7 +499,8 @@ class TestTunnelNetworkConfig(unittest.TestCase):
             for script in scripts
         ))
         self.assertTrue(any(
-            command[:2] == ("route.exe", "ADD")
+            command[0].lower().endswith("route.exe")
+            and command[1] == "ADD"
             and command[2] == "198.51.100.10"
             and "13" in command
             for command in commands

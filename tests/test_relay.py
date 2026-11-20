@@ -10,7 +10,7 @@ from core.handshake import ClientHandshake
 from core.protocol import Packet, PacketType
 from core.scheduler import BondingMode
 from daemon import ClientDaemon
-from relay import ClientSession, RelayServer, SESSION_TTL
+from relay import ClientSession, IP_REUSE_COOLDOWN, RelayServer, SESSION_TTL
 
 
 class TestRelayDownlinkAndProbes(unittest.TestCase):
@@ -46,22 +46,41 @@ class TestRelayDownlinkAndProbes(unittest.TestCase):
     def test_client_bonding_mode_controls_relay_downlink(self):
         secondary = NetworkAdapter("Secondary", "198.51.100.10")
         secondary.priority = 2
-        self.session.update_path(2, ("127.0.0.1", 49153))
+        secondary_sock = Mock()
+        self.client.paths[2] = (secondary_sock, secondary)
+        self.client.scheduler.set_mode(BondingMode.REDUNDANT)
+        self.client._send_ip_packet(b"register both paths")
+        for sock, source_port in (
+            (self.client_sock, self.client_addr[1]),
+            (secondary_sock, 49153),
+        ):
+            for call in sock.sendto.call_args_list:
+                self.relay._handle_incoming(
+                    call.args[0], ("127.0.0.1", source_port),
+                )
+
+        self.assertEqual(self.session.paths[1][3].priority, 1)
+        self.assertEqual(self.session.paths[2][3].priority, 2)
 
         for mode in (BondingMode.SPEED, BondingMode.FAILOVER, BondingMode.REDUNDANT):
             with self.subTest(mode=mode):
+                self.client_sock.reset_mock()
+                secondary_sock.reset_mock()
                 self.client.scheduler.set_mode(mode)
                 self.client._send_ip_packet(b"client packet")
-                uplink = self.client_sock.sendto.call_args.args[0]
-                self.relay._handle_incoming(uplink, self.client_addr)
+                for sock, source_port in (
+                    (self.client_sock, self.client_addr[1]),
+                    (secondary_sock, 49153),
+                ):
+                    for call in sock.sendto.call_args_list:
+                        self.relay._handle_incoming(
+                            call.args[0], ("127.0.0.1", source_port),
+                        )
                 self.assertEqual(self.session.scheduler.mode, mode)
 
                 payload = bytearray(20)
                 payload[0] = 0x45
                 payload[16:20] = self.session.ip_bytes
-                self.session.paths[2] = (
-                    "127.0.0.1", 49153, self.session.paths[2][2], secondary,
-                )
                 self.relay.sock.reset_mock()
                 self.relay._handle_downlink(bytes(payload))
                 sent_paths = [
@@ -74,6 +93,63 @@ class TestRelayDownlinkAndProbes(unittest.TestCase):
                 )
                 if mode == BondingMode.FAILOVER:
                     self.assertEqual(sent_paths, [self.client_addr])
+
+    def test_client_rejects_replayed_authenticated_packets_before_refreshing_liveness(self):
+        packet = Packet(
+            PacketType.PROBE_REQ,
+            self.client.session_id,
+            path_id=1,
+            seq_num=77,
+        )
+        plaintext = b"probe"
+        aad = packet.header_bytes()
+        packet.payload = self.session.crypto.encrypt(
+            plaintext, packet.seq_num, packet.path_id,
+            int(packet.pkt_type), aad,
+        )
+        raw = packet.serialize()
+
+        with patch("daemon.time.monotonic", side_effect=[100.0, 200.0]):
+            self.client._on_datagram(raw, 1, self.adapter)
+            self.client._on_datagram(raw, 1, self.adapter)
+
+        self.assertEqual(self.client.last_rx, 100.0)
+        self.assertEqual(self.client.total_rx_packets, 1)
+
+    def test_authenticated_disconnect_releases_session(self):
+        self.client._send_disconnect()
+        disconnect = Packet.deserialize(self.client_sock.sendto.call_args.args[0])
+        self.assertIsNotNone(disconnect)
+        self.assertEqual(disconnect.pkt_type, PacketType.DISCONNECT)
+
+        self.relay._handle_incoming(
+            self.client_sock.sendto.call_args.args[0], self.client_addr,
+        )
+
+        self.assertNotIn(self.client.session_id, self.relay.sessions)
+        self.assertEqual(len(self.relay._quarantined_ips), 1)
+
+    def test_relay_rejects_new_paths_after_per_session_limit(self):
+        for path_id in range(1, 34):
+            packet = Packet(
+                PacketType.DATA,
+                self.client.session_id,
+                path_id=path_id,
+                seq_num=path_id,
+            )
+            plaintext = b"test"
+            aad = packet.header_bytes()
+            packet.payload = self.client.crypto.encrypt(
+                plaintext, packet.seq_num, packet.path_id,
+                int(packet.pkt_type), aad,
+            )
+            self.relay._handle_incoming(
+                packet.serialize(), ("127.0.0.1", 49000 + path_id),
+            )
+
+        self.assertEqual(len(self.session.paths), 32)
+        self.assertNotIn(33, self.session.paths)
+        self.assertNotIn((33, int(PacketType.DATA)), self.session.replay_windows)
 
     def test_replayed_authenticated_packet_cannot_move_a_path(self):
         self.client._send_ip_packet(b"test payload")
@@ -175,6 +251,54 @@ class TestRelayDownlinkAndProbes(unittest.TestCase):
 
 
 class TestRelayClientCredentials(unittest.TestCase):
+    def test_init_replay_cache_is_bounded_per_authenticated_client(self):
+        alice_secret = "QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8"
+        relay = RelayServer(
+            secret=None,
+            client_secrets={"alice": alice_secret},
+        )
+        relay.sock = Mock()
+        session_id = 1234
+
+        with patch("relay.INIT_RATE_LIMIT_PER_CLIENT", 100):
+            for _ in range(65):
+                handshake = ClientHandshake(
+                    relay.client_psks["alice"], session_id, "alice",
+                )
+                init = Packet(
+                    PacketType.HANDSHAKE_INIT,
+                    session_id,
+                    payload=handshake.build_init(),
+                )
+                relay._handle_init(init, ("127.0.0.1", 49152))
+
+        self.assertEqual(relay._init_cache_counts["alice"], 64)
+        self.assertEqual(len(relay._seen_init_nonces), 64)
+        self.assertEqual(relay.sessions[session_id].tunnel_ip, "10.8.0.2")
+
+    def test_new_init_rate_limit_counts_only_distinct_accepted_nonces(self):
+        alice_secret = "QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8"
+        relay = RelayServer(
+            secret=None,
+            client_secrets={"alice": alice_secret},
+        )
+        relay.sock = Mock()
+        session_id = 5678
+
+        for _ in range(9):
+            handshake = ClientHandshake(
+                relay.client_psks["alice"], session_id, "alice",
+            )
+            init = Packet(
+                PacketType.HANDSHAKE_INIT,
+                session_id,
+                payload=handshake.build_init(),
+            )
+            relay._handle_init(init, ("127.0.0.1", 49152))
+
+        self.assertEqual(relay.sessions_created_total, 8)
+        self.assertEqual(relay._init_cache_counts["alice"], 8)
+
     def test_per_client_session_limit_blocks_exhaustion(self):
         alice_secret = "QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8"
         with patch("daemon.AdapterManager"):
@@ -273,6 +397,18 @@ class TestRelayClientCredentials(unittest.TestCase):
 
 
 class TestRelayMetrics(unittest.TestCase):
+    def test_conntrack_flush_targets_only_the_reassigned_tunnel_source(self):
+        relay = RelayServer(secret="ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8")
+        relay.tun = Mock()
+        with patch("relay.platform.system", return_value="Linux"), \
+                patch("relay.subprocess.run", return_value=Mock(returncode=0)) as run:
+            relay._flush_tunnel_ip_conntrack("10.8.0.2")
+
+        self.assertEqual(
+            run.call_args.args[0],
+            ["conntrack", "-D", "--orig-src", "10.8.0.2"],
+        )
+
     def test_metrics_endpoint_is_loopback_only_and_exposes_aggregate_counters(self):
         relay = RelayServer(
             host="127.0.0.1",
@@ -330,6 +466,14 @@ class TestRelayMetrics(unittest.TestCase):
 
         self.assertEqual(relay.sessions_expired_total, 1)
         self.assertEqual(len(relay.sessions), 0)
+        self.assertEqual(relay._free_ips.count(session.tunnel_ip), 0)
+        self.assertEqual(
+            relay._quarantined_ips[-1],
+            (100.0 + SESSION_TTL + 1.0 + IP_REUSE_COOLDOWN, session.tunnel_ip),
+        )
+        relay._release_quarantined_ips(
+            100.0 + SESSION_TTL + 1.0 + IP_REUSE_COOLDOWN,
+        )
         self.assertEqual(relay._free_ips.count(session.tunnel_ip), 1)
 
     def test_invalid_metrics_port_fails_explicitly(self):

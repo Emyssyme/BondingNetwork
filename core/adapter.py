@@ -13,6 +13,8 @@ import subprocess
 import platform
 from typing import Dict, List, Optional
 
+from core.windows import system_executable
+
 class NetworkAdapter:
     def __init__(
         self,
@@ -177,12 +179,7 @@ def get_windows_interface_indices() -> Dict[str, int]:
         "Get-NetIPInterface -AddressFamily IPv4 | "
         "Select-Object InterfaceAlias,InterfaceIndex | ConvertTo-Json -Compress"
     )
-    system_root = os.environ.get("SystemRoot")
-    if not system_root:
-        raise RuntimeError("SystemRoot is not set; cannot query Windows interface indexes")
-    powershell = os.path.join(
-        system_root,
-        "System32",
+    powershell = system_executable(
         "WindowsPowerShell",
         "v1.0",
         "powershell.exe",
@@ -279,7 +276,9 @@ class AdapterManager:
             desc = win_descs.get(iface_name, "")
             lower_desc = desc.lower()
 
-            if any(k in lower_name or k in lower_desc for k in ignored_keywords):
+            if lower_name.startswith(("msp0", "msps0")) or any(
+                k in lower_name or k in lower_desc for k in ignored_keywords
+            ):
                 continue
                 
             # Check if interface is up

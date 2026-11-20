@@ -14,6 +14,8 @@ import uuid
 from dataclasses import dataclass
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
+from core.windows import system_executable
+
 logger = logging.getLogger("MySpeedify.TunnelRoutes")
 
 
@@ -143,6 +145,11 @@ class TunnelNetworkConfig:
             self._run_cleanups()
             self._installed = False
 
+    def cleanup_stale(self) -> None:
+        """Remove persisted state left by an interrupted tunnel process."""
+        with self._lock:
+            self._cleanup_stale()
+
     def _install_linux(self) -> None:
         tun_name = self.tun.name
         comment = f"msp-{os.getpid()}-{uuid.uuid4().hex[:8]}"
@@ -224,11 +231,11 @@ class TunnelNetworkConfig:
             ("128.0.0.0", "128.0.0.0"),
         ):
             self._run(
-                "route.exe", "ADD", destination, "MASK", mask, "0.0.0.0",
+                system_executable("route.exe"), "ADD", destination, "MASK", mask, "0.0.0.0",
                 "IF", str(tun_index), "METRIC", "1",
             )
             self._cleanups.append(lambda dst=destination, msk=mask: self._run(
-                "route.exe", "DELETE", dst, "MASK", msk, "0.0.0.0", "IF", str(tun_index),
+                system_executable("route.exe"), "DELETE", dst, "MASK", msk, "0.0.0.0", "IF", str(tun_index),
             ))
 
         dns_before = self._windows_dns(tun_index)
@@ -353,11 +360,11 @@ class TunnelNetworkConfig:
             raise RuntimeError(f"No IPv4 gateway found for {path.interface_name}")
         gateway = str(ipaddress.IPv4Address(gateway))
         self._run(
-            "route.exe", "ADD", relay_ip, "MASK", "255.255.255.255",
+            system_executable("route.exe"), "ADD", relay_ip, "MASK", "255.255.255.255",
             gateway, "IF", str(index), "METRIC", "1",
         )
         return [lambda: self._run(
-            "route.exe", "DELETE", relay_ip, "MASK", "255.255.255.255",
+            system_executable("route.exe"), "DELETE", relay_ip, "MASK", "255.255.255.255",
             gateway, "IF", str(index),
         )]
 
@@ -512,15 +519,19 @@ class TunnelNetworkConfig:
             "Remove-NetFirewallRule -Confirm:$false -ErrorAction Stop"
         )
 
-        tun_index = self._interface_index(self.tun.adapter_name)
-        for destination in ("0.0.0.0/1", "128.0.0.0/1"):
-            self._powershell(
-                f"Get-NetRoute -InterfaceIndex {tun_index} -AddressFamily IPv4 "
-                "-ErrorAction SilentlyContinue | "
-                f"Where-Object {{ $_.DestinationPrefix -eq '{destination}' }} | "
-                "ForEach-Object { Remove-NetRoute -InputObject $_ "
-                "-Confirm:$false -ErrorAction Stop }"
-            )
+        try:
+            tun_index = self._interface_index(self.tun.adapter_name)
+        except RuntimeError:
+            logger.info("No MySpeedify tunnel adapter found during stale-state cleanup")
+        else:
+            for destination in ("0.0.0.0/1", "128.0.0.0/1"):
+                self._powershell(
+                    f"Get-NetRoute -InterfaceIndex {tun_index} -AddressFamily IPv4 "
+                    "-ErrorAction SilentlyContinue | "
+                    f"Where-Object {{ $_.DestinationPrefix -eq '{destination}' }} | "
+                    "ForEach-Object { Remove-NetRoute -InputObject $_ "
+                    "-Confirm:$false -ErrorAction Stop }"
+                )
         for path in self._paths.values():
             index = path.if_index or self._interface_index(path.interface_name)
             self._powershell(
@@ -628,7 +639,10 @@ class TunnelNetworkConfig:
 
     def _powershell(self, script: str) -> str:
         return self._run(
-            "powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script,
+            system_executable(
+                "WindowsPowerShell", "v1.0", "powershell.exe",
+            ),
+            "-NoProfile", "-NonInteractive", "-Command", script,
         ).stdout.strip()
 
     def _run(self, *command: str):

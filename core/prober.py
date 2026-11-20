@@ -10,6 +10,9 @@ from typing import Dict, Optional, Tuple
 from collections import deque
 from .protocol import Packet, PacketType, PacketFlag, ProbeData
 
+ACTIVE_PROBE_WINDOW_SECONDS = 5.0
+IDLE_PROBE_INTERVAL_SECONDS = 5.0
+
 
 class PathMetrics:
     PROBE_TIMEOUT_SECONDS = 3.0
@@ -167,30 +170,39 @@ class LinkProber:
             self.paths[path_id] = PathMetrics(path_id)
         return self.paths[path_id]
 
-    def should_probe(self) -> bool:
+    def should_probe(self, interval_seconds: Optional[float] = None) -> bool:
+        interval = self.interval if interval_seconds is None else interval_seconds
         return (
             self.last_probe_time is None
-            or time.monotonic() - self.last_probe_time >= self.interval
+            or time.monotonic() - self.last_probe_time >= interval
         )
 
-    def generate_probes(self, active_path_ids: list[int], session_id: int) -> list[Tuple[int, Packet]]:
-        """Generates probe request packets for all active paths"""
+    def generate_probes(
+        self,
+        active_path_ids: list[int],
+        session_id: int,
+        *,
+        capacity: bool = True,
+    ) -> list[Tuple[int, Packet]]:
+        """Generates lightweight liveness probes or padded capacity trains."""
         now = time.monotonic()
         self.last_probe_time = now
         packets = []
         
         for path_id in active_path_ids:
             metrics = self.get_path_metrics(path_id)
-            train_id = self.probe_seq_counter
-            for _ in range(self.CAPACITY_TRAIN_SIZE):
+            train_size = self.CAPACITY_TRAIN_SIZE if capacity else 1
+            train_id = self.probe_seq_counter if capacity else None
+            pad_size = self.CAPACITY_PROBE_PADDING if capacity else 0
+            for _ in range(train_size):
                 seq = self.probe_seq_counter
                 self.probe_seq_counter += 1
                 payload = metrics.record_probe_sent(
                     seq,
                     sent_at=now,
-                    pad_size=self.CAPACITY_PROBE_PADDING,
+                    pad_size=pad_size,
                     train_id=train_id,
-                    train_size=self.CAPACITY_TRAIN_SIZE,
+                    train_size=train_size if capacity else 0,
                 )
                 pkt = Packet(
                     pkt_type=PacketType.PROBE_REQ,

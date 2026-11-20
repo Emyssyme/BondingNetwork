@@ -17,6 +17,8 @@ class MySpeedifyApp {
       adapters: {} // ip -> array of speeds
     };
     this.adapterCards = new Map();
+    this.adapterColors = new Map();
+    this.nextAdapterColor = 0;
     this.pendingAdapterToggles = new Map();
     
     this.colorPalette = ['#00f0ff', '#8b5cf6', '#10b981', '#f59e0b', '#ec4899'];
@@ -72,6 +74,7 @@ class MySpeedifyApp {
     this.btnRefreshAdapters = document.getElementById('btn-refresh-adapters');
     this.elStatusPill = document.getElementById('status-pill');
     this.elConnectionStatus = document.getElementById('connection-status-text');
+    this.elConnectionError = document.getElementById('connection-error');
     if (this.btnRefreshAdapters) {
       this.btnRefreshAdapters.addEventListener('click', () => this.refreshAdapters());
     }
@@ -221,6 +224,8 @@ class MySpeedifyApp {
     this.elConnectionStatus.textContent = connected
       ? 'Connected'
       : (state === 'error' ? 'Error' : (state === 'disconnected' ? 'Disconnected' : 'Connecting'));
+    this.elConnectionError.textContent = data.error || '';
+    this.elConnectionError.hidden = !data.error;
 
     // Top Level Metrics
     this.elTotalDown.textContent = data.download_mbps.toFixed(2);
@@ -291,7 +296,7 @@ class MySpeedifyApp {
     legendNodes.append(totalLegend);
 
     adapters.forEach((adapter, idx) => {
-      const color = this.colorPalette[idx % this.colorPalette.length];
+      const color = this.colorForAdapter(adapter.ip);
       const icon = adapter.is_wifi ? 'fa-wifi' : (adapter.is_cellular ? 'fa-tower-cell' : 'fa-ethernet');
       const typeLabel = adapter.is_wifi ? 'Wi-Fi' : (adapter.is_cellular ? 'Cellular / USB' : 'Ethernet');
       let card = this.adapterCards.get(adapter.ip);
@@ -317,6 +322,15 @@ class MySpeedifyApp {
     });
 
     this.elChartLegend.replaceChildren(legendNodes);
+  }
+
+  colorForAdapter(ip) {
+    if (!this.adapterColors.has(ip)) {
+      const color = this.colorPalette[this.nextAdapterColor % this.colorPalette.length];
+      this.adapterColors.set(ip, color);
+      this.nextAdapterColor++;
+    }
+    return this.adapterColors.get(ip);
   }
 
   createAdapterCard(ip) {
@@ -426,14 +440,14 @@ class MySpeedifyApp {
     this.chartData.total.shift();
     this.chartData.total.push(totalSpeed);
 
+    const adapters = {};
     (data.adapters || []).forEach(adapter => {
-      if (!this.chartData.adapters[adapter.ip]) {
-        this.chartData.adapters[adapter.ip] = new Array(this.chartHistoryLength).fill(0);
-      }
+      const history = this.chartData.adapters[adapter.ip]
+        || new Array(this.chartHistoryLength).fill(0);
       const speed = (adapter.download_speed_mbps + adapter.upload_speed_mbps) || 0;
-      this.chartData.adapters[adapter.ip].shift();
-      this.chartData.adapters[adapter.ip].push(speed);
+      adapters[adapter.ip] = [...history.slice(1), speed];
     });
+    this.chartData.adapters = adapters;
   }
 
   initCanvas() {
@@ -490,11 +504,9 @@ class MySpeedifyApp {
     maxVal *= 1.25; // Headroom
 
     // Draw individual adapter lines
-    let adapterIndex = 0;
     for (const [ip, values] of Object.entries(this.chartData.adapters)) {
-      const color = this.colorPalette[adapterIndex % this.colorPalette.length];
+      const color = this.colorForAdapter(ip);
       this.drawSmoothSeries(ctx, values, color, maxVal, w, h, false);
-      adapterIndex++;
     }
 
     // Draw total bonded line with glowing gradient fill

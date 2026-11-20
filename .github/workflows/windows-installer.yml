@@ -1,0 +1,47 @@
+name: Windows client installer
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: requirements.lock.txt
+      - name: Install runtime dependencies and PyInstaller
+        run: |
+          python -m pip install --require-hashes -r requirements.lock.txt
+          python -m pip install pyinstaller==6.22.3
+      - name: Install Inno Setup
+        run: choco install innosetup --yes --no-progress
+      - name: Set installer version from tag
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: |
+          $version = $env:GITHUB_REF_NAME -replace '^v', ''
+          "MYSPEEDIFY_APP_VERSION=$version" >> $env:GITHUB_ENV
+      - name: Build installer
+        shell: pwsh
+        run: .\client\build_windows.ps1
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MySpeedify-Windows-Installer
+          path: dist-installer/MySpeedify-Setup.exe
+          if-no-files-found: error
+      - name: Attach installer to tagged release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$env:GITHUB_REF_NAME" dist-installer/MySpeedify-Setup.exe --title "MySpeedify $env:GITHUB_REF_NAME" --generate-notes

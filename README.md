@@ -84,6 +84,72 @@ provisioned on the relay. The client prints a one-time
 dashboard URL bound to localhost. Windows requires the bundled, hash-verified
 Wintun driver and Administrator rights; Linux requires `/dev/net/tun`,
 route-management privileges, and `systemd-resolved` for DNS integration.
+If the client process is terminated abnormally and network access remains
+blocked, close any running instance and run `python main.py --cleanup` with
+Administrator/root privileges. Cleanup refuses to run while another instance
+holds the client lock.
+
+### Windows client installer
+
+Windows installers are built from version tags (for example `v0.1.0`) and
+attached to the GitHub release. The workflow can also be started manually from
+GitHub Actions; its installer is then available as a workflow artifact.
+
+To build locally, install 64-bit Python 3.12-3.14, the hash-pinned runtime
+dependencies, PyInstaller 6.22.3, and Inno Setup 6, then run in PowerShell from
+the repository root:
+
+```powershell
+python -m pip install --require-hashes -r requirements.lock.txt
+python -m pip install pyinstaller==6.22.3
+.\client\build_windows.ps1
+```
+
+The installer is written to `dist-installer\MySpeedify-Setup.exe`. It installs
+the bundled client and verified Wintun DLL under Program Files, creates Start
+Menu and optional desktop shortcuts, and requests administrator approval when
+the client starts. It does not install or configure a relay or store client
+credentials.
+
+To build only the standalone executable, install 64-bit Python 3.12-3.14, the
+hash-pinned runtime dependencies, and PyInstaller 6.22.3 as above; Inno Setup
+is not needed. Then run:
+
+```powershell
+.\client\build_exe.ps1
+```
+
+This creates the self-contained `dist\MySpeedify.exe`; it still requires
+Administrator approval at launch and the client credentials configured below.
+
+Before launching the client, configure its relay and secret in the current
+Windows user's environment. For example, in PowerShell, create a secret file
+without putting its value in shell history or the command line:
+
+```powershell
+$secretPath = Join-Path $env:LOCALAPPDATA "MySpeedify\secret"
+New-Item -ItemType Directory -Force (Split-Path $secretPath) | Out-Null
+$secureSecret = Read-Host "Client secret" -AsSecureString
+$secretBstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureSecret)
+try {
+    $plainSecret = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($secretBstr)
+    Set-Content -Path $secretPath -Value $plainSecret -NoNewline -Encoding ascii
+}
+finally {
+    [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($secretBstr)
+    Remove-Variable plainSecret -ErrorAction SilentlyContinue
+}
+$identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+icacls $secretPath /inheritance:r /grant:r "${identity}:(F)" "SYSTEM:(F)"
+[Environment]::SetEnvironmentVariable("MYSPEEDIFY_SECRET_FILE", $secretPath, "User")
+[Environment]::SetEnvironmentVariable("MYSPEEDIFY_SERVER_HOST", "YOUR_VPS_IP", "User")
+[Environment]::SetEnvironmentVariable("MYSPEEDIFY_SERVER_PORT", "51820", "User")
+```
+
+For a provisioned per-client credential, also set `MYSPEEDIFY_CLIENT_ID` as a
+user environment variable. Sign out and back in after setting environment
+variables so the Start Menu shortcut receives them. The client secret must be
+the canonical 43-character URL-safe base64 value for 32 random bytes.
 
 ### Per-client authentication and migration
 
@@ -141,6 +207,14 @@ unchanged.
 Speed-mode capacity is estimated from trains of four padded probes and smoothed
 across recent estimates. This is a relative burst-capacity signal, not a
 throughput guarantee; validate performance on the target network.
+When there has been no user traffic for five seconds, the client and relay
+switch to one unpadded liveness probe every five seconds. Padded capacity trains
+resume while user traffic is active and for five seconds after it stops.
+
+The relay caps authenticated INITs at eight new sessions per client per minute,
+retains at most 64 INIT replay entries per client, and accepts at most 32 paths
+per session. Expired session addresses are held for 120 seconds and their
+conntrack entries are removed before an address is reassigned.
 
 ---
 
@@ -165,6 +239,16 @@ sudo ./setup_linux.sh
    host's global iptables rules. The relay runs as the `myspeedify` system user
    with `CAP_NET_ADMIN` for TUN configuration. IPv4 forwarding is enabled;
    IPv6 forwarding is not changed.
+
+   The firewall unit intentionally keeps its policy installed when the relay
+   service stops, so stopping the relay does not silently remove host protection.
+   To explicitly remove the MySpeedify firewall policy when decommissioning:
+
+   ```bash
+   sudo systemctl stop myspeedify-server.service
+   sudo python3 /opt/myspeedify/server/firewall.py remove --wan auto
+   sudo systemctl stop myspeedify-firewall.service
+   ```
 
 To rotate an exposed or expired secret after deploying the updated relay, run:
 ```bash
